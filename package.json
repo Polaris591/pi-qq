@@ -5,7 +5,9 @@
   "main": "bridge.js",
   "scripts": {
     "start": "node bridge.js",
-    "test": "node utest.js"
+    "test": "node utest.js && node itest.js",
+    "test:unit": "node utest.js",
+    "test:e2e": "node itest.js"
   },
   "keywords": [
     "qq",
