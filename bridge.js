@@ -729,7 +729,7 @@ class PiSession {
       this.proc = null;
       if (this.busy) {
         this.busy = false;
-        this.flush(true);
+        this.flush(true).catch((e) => warn(`[${this.key}] flush 失败: ${e.message}`));
         // 必须 catch: sendQQ 失败会变成 unhandledRejection,
         // 而顶层把它当致命错误 => 整个桥接退出。偏偏这里正是 pi 刚崩溃、
         // QQ 连接也可能不正常的时刻, 不能因为提示发不出去就把桥接也拖死。
@@ -780,7 +780,7 @@ class PiSession {
           this.buf += ev.delta;
           const since = Date.now() - this.lastFlush;
           if (this.buf.length >= cfg.behavior.maxChars * 0.8 || since > cfg.behavior.flushIntervalMs) {
-            this.flush();
+            this.flush().catch((e) => warn(`[${this.key}] flush 失败: ${e.message}`));
           } else this.armFlushTimer();
         }
         break;
@@ -795,7 +795,7 @@ class PiSession {
           const tooSoon = now - (this.lastToolNoticeAt || 0) < gap;
           if (!tooSoon) {
             this.lastToolNoticeAt = now;
-            this.flush(true);
+            this.flush(true).catch((e) => warn(`[${this.key}] flush 失败: ${e.message}`));
             this.sendQQ(describeToolCall(rec.toolName, rec.args), { plain: true }).catch(() => {});
           }
         }
@@ -812,7 +812,7 @@ class PiSession {
         if (reason === 'error' && !this.abortRequested) {
           // 定时任务: 交给 runTask 统一通知 (任务会话是临时的, 这里发不出去)
           if (typeof this.onTaskError === 'function') { this.onTaskError('模型调用出错'); break; }
-          this.flush(true);
+          this.flush(true).catch((e) => warn(`[${this.key}] flush 失败: ${e.message}`));
           const tail = this.stderrTail.join('').trim().split('\n').slice(-4).join('\n');
           // 不用 ``` 围栏: QQ 不渲染 Markdown, 三个反引号会原样露出来
           const body = tail ? `\n${mdToPlain(tail)}` : '';
@@ -821,7 +821,7 @@ class PiSession {
         break;
       }
       case 'agent_settled': {
-        this.flush(true);
+        this.flush(true).catch((e) => warn(`[${this.key}] flush 失败: ${e.message}`));
         this.busy = false;
         this.abortRequested = false;
         this.lastUsed = Date.now();
@@ -836,7 +836,10 @@ class PiSession {
 
   armFlushTimer() {
     if (this.flushTimer) return;
-    this.flushTimer = setTimeout(() => { this.flushTimer = null; this.flush(); }, cfg.behavior.flushIntervalMs);
+    this.flushTimer = setTimeout(() => {
+      this.flushTimer = null;
+      this.flush().catch((e) => warn(`[${this.key}] flush 失败: ${e.message}`));
+    }, cfg.behavior.flushIntervalMs);
   }
 
   /**
@@ -846,7 +849,9 @@ class PiSession {
    */
   async flush(force, ctx) {
     if (this.flushTimer) { clearTimeout(this.flushTimer); this.flushTimer = null; }
-    let text = this.buf.trim();
+    // 类型兜底: buf 理论上一直是字符串, 但这里一旦抛错会变成 unhandledRejection
+    // 进而触发 fatal() 把整个桥接拖死。用 String() 包一层, 代价可忽略。
+    let text = String(this.buf ?? '').trim();
     this.buf = '';
     this.lastFlush = Date.now();
     if (!text) return;
@@ -947,6 +952,15 @@ class PiSession {
         const lastWarn = this.queueWarnAt.get(k) || 0;
         if (now - lastWarn < 10000) return;
         this.queueWarnAt.set(k, now);
+        // 有界: 每个发言者一条, 群大/长期跑会一直涨。超量时先清过期的, 再丢最旧的。
+        if (this.queueWarnAt.size > 500) {
+          for (const [kk, t] of this.queueWarnAt) {
+            if (now - t >= 60000) this.queueWarnAt.delete(kk);
+          }
+          while (this.queueWarnAt.size > 500) {
+            this.queueWarnAt.delete(this.queueWarnAt.keys().next().value);
+          }
+        }
         this.sendQQ(msg, { plain: true, ...(ctx && ctx.userId ? { atUser: ctx.userId } : {}) }).catch(() => {});
       };
       if (this.queue.length >= this.maxQueue) {

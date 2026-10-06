@@ -456,6 +456,23 @@ ok('memoryPromptFile 幂等可重写', B.memoryPromptFile('group_10001') === mf)
   s4.prompt('hi', [], { userId: '9', userName: '小明' });
   ok('排队时告知位置', sent.some((x) => String(x.params.message).includes('已排队')), '');
   ok('队列元素保留 ctx', s2.queue[0].ctx && s2.queue[0].ctx.replyTo === '0', JSON.stringify(s2.queue[0].ctx));
+  // 排队提示的去重表必须有上限: 每个发言者一条, 群大/长期跑会一直涨
+  {
+    const s5 = mk(); s5.busy = true; s5.queueWarnAt = new Map(); s5.sendQQ = async () => {};
+    for (let i = 0; i < 1200; i++) s5.prompt('x', [], { userId: 'u' + i, userName: 'n' + i });
+    ok('排队提示去重表有上限', s5.queueWarnAt.size <= 500, `size=${s5.queueWarnAt.size}`);
+  }
+  // flush 必须能被安全调用: buf 异常时不能抛 (抛了会变成 unhandledRejection -> 杀进程)
+  {
+    const s6 = mk();
+    let threw = null;
+    s6.buf = null;
+    try { await s6.flush(true); } catch (e) { threw = e; }
+    ok('flush 对异常 buf 不抛错', threw === null, threw ? threw.message : '');
+    s6.buf = undefined;
+    try { await s6.flush(true); } catch (e) { threw = e; }
+    ok('flush 对 undefined buf 不抛错', threw === null, threw ? threw.message : '');
+  }
 
   // ---- 群聊背景上下文
   const gh = [
