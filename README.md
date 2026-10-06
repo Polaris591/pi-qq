@@ -28,17 +28,49 @@ QQ 客户端 ←→ NapCat (Docker) ←→ bridge.js ←→ pi --mode rpc (每�
 `bridge.js` 通过 OneBot 11 的 WebSocket 与 NapCat 通信，通过 RPC（JSONL over stdin/stdout）
 驱动 pi 子进程。每个 QQ 会话（一个私聊 or 一个群）对应一个长期存活的 pi 进程。
 
-## 依赖
+## 前置依赖
 
-- Node.js 18+（用了 `structuredClone` 之外的标准库，实测 Node 24 可用）
-- 一个跑起来的 NapCat（推荐 Docker），开了正向 WebSocket
-- pi CLI 在 PATH 里
+跑起来需要三样东西，缺一不可：
+
+**1. Node.js 18+**
+
+```bash
+node -v     # 确认版本
+```
+
+**2. pi CLI（本项目的核心，必须先装好）**
+
+```bash
+npm install -g @earendil-works/pi-coding-agent
+pi --version    # 能输出版本号才算装好
+```
+
+装好后还要给 pi 配一个模型 provider（API key 之类），详见
+[pi 的文档](https://github.com/earendil-works/pi)。**pi 自己不能对话的话，桥接也跑不起来。**
+
+> 如果 pi 不在 PATH 里（比如装在别处），在 `config.json` 里把 `pi.bin`
+> 改成它的完整路径，例如 `"/usr/local/bin/pi"`。
+
+**3. NapCat（QQ 侧）**
+
+推荐 Docker 跑：
+
+```bash
+docker run -d --name napcat \
+  -p 3001:3001 \
+  -v /path/to/napcat-data:/app/.config/QQ \
+  mlikiowa/napcat-docker:latest
+```
+
+首次启动要用手机 QQ 扫码登录（容器里 `/app/qrcode.png`，或看容器日志）。
+然后在 NapCat 的 WebUI 里**开启正向 WebSocket**，端口对上 `config.json` 里的 `napcat.url`。
+
 - 可选：systemd（用看门狗和自动重启的话）
 
 ## 安装
 
 ```bash
-git clone https://github.com/<you>/pi-qq.git
+git clone https://github.com/Polaris591/pi-qq.git
 cd pi-qq
 npm install                      # 只依赖 ws
 
@@ -53,6 +85,21 @@ vim config.json                  # 至少填 napcat.url 和两个白名单
 ```bash
 node bridge.js
 ```
+
+启动成功会看到：
+
+```
+连接 NapCat: ws://127.0.0.1:3001
+outbox 监控: ...
+pi-qq 桥接启动: napcat=ws://127.0.0.1:3001 maxSessions=5
+NapCat WebSocket 已连接
+登录账号: <你的QQ号> (<昵称>)
+```
+
+然后给这个 QQ 发条消息试试。**第一次收到消息时才会启动 pi 子进程**（会慢几秒）。
+
+> 白名单是空的会启动失败吗？不会，但所有消息都会被忽略，日志里会有 ⚠️ 提示。
+> 记得把自己 QQ 号填进 `access.privateWhitelist`。
 
 用 systemd 托管（推荐，能拿到看门狗和自动重启）：
 

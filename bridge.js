@@ -22,7 +22,36 @@ const WebSocket = require('ws');
 
 const ROOT = __dirname;
 const CONFIG_PATH = process.env.PI_QQ_CONFIG || path.join(ROOT, 'config.json');
-const config = JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8'));
+
+/** 读配置: 缺文件/格式错时给出能看懂的提示, 而不是甩一堆 Node 堆栈 */
+function loadConfig() {
+  let raw;
+  try {
+    raw = fs.readFileSync(CONFIG_PATH, 'utf8');
+  } catch (e) {
+    if (e.code === 'ENOENT') {
+      console.error(`找不到配置文件: ${CONFIG_PATH}`);
+      console.error('');
+      console.error('第一次使用请先复制一份模板:');
+      console.error(`  cp ${path.join(ROOT, 'config.example.json')} ${CONFIG_PATH}`);
+      console.error('');
+      console.error('然后至少填好 napcat.url 和 access 里的两个白名单。');
+      process.exit(1);
+    }
+    throw e;
+  }
+  try {
+    return JSON.parse(raw);
+  } catch (e) {
+    console.error(`配置文件不是合法 JSON: ${CONFIG_PATH}`);
+    console.error(`  ${e.message}`);
+    console.error('');
+    console.error('常见原因: 多了逗号、少了引号、用了注释(JSON 不支持注释)。');
+    process.exit(1);
+  }
+}
+
+const config = loadConfig();
 
 /**
  * 合并配置: 只覆盖「有值」的项。
@@ -720,7 +749,14 @@ class PiSession {
       }
     });
     this.proc.on('error', (e) => {
-      warn(`[${this.key}] pi 启动失败: ${e.message}`);
+      // 最常见的原因: pi 没装 / 不在 PATH 里。说清楚怎么解决, 别只甩 ENOENT。
+      if (e.code === 'ENOENT') {
+        warn(`[${this.key}] 启动 pi 失败: 找不到可执行文件 "${cfg.pi.bin}"`);
+        warn('  请先安装 pi CLI, 或把 config.json 里的 pi.bin 改成它的完整路径。');
+        warn('  安装方式见 https://github.com/earendil-works/pi');
+      } else {
+        warn(`[${this.key}] pi 启动失败: ${e.message}`);
+      }
     });
   }
 
