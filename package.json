@@ -1,0 +1,27 @@
+{
+  "name": "pi-qq",
+  "version": "1.0.0",
+  "description": "把 pi coding agent 接到 QQ 上的桥接（基于 NapCat / OneBot 11）",
+  "main": "bridge.js",
+  "scripts": {
+    "start": "node bridge.js",
+    "test": "node utest.js"
+  },
+  "keywords": [
+    "qq",
+    "napcat",
+    "onebot",
+    "pi",
+    "coding-agent",
+    "bot"
+  ],
+  "author": "Polaris",
+  "license": "MIT",
+  "type": "commonjs",
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "ws": "^8.22.0"
+  }
+}

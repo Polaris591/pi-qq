@@ -1,0 +1,60 @@
+{
+  "napcat": {
+    "url": "ws://127.0.0.1:3001",
+    "token": ""
+  },
+  "pi": {
+    "bin": "pi",
+    "cwd": "",
+    "sessionDir": "",
+    "provider": "",
+    "model": "",
+    "tools": "",
+    "extraArgs": []
+  },
+  "access": {
+    "privateWhitelist": [],
+    "groupWhitelist": [],
+    "allowAllPrivate": false,
+    "allowAllGroups": false,
+    "requireAtInGroup": true
+  },
+  "files": {
+    "outboxDir": "",
+    "containerOutbox": "/app/napcat/config/outbox",
+    "inboxDir": "",
+    "stateDir": ""
+  },
+  "memory": {
+    "dir": "",
+    "memberDir": "",
+    "maxBytes": 16384,
+    "memberMaxBytes": 4096
+  },
+  "behavior": {
+    "maxSessions": 5,
+    "idleTimeoutMs": 1800000,
+    "maxChars": 2500,
+    "flushIntervalMs": 6000,
+    "progressOnToolCall": false,
+    "startupNotice": true,
+    "groupReplyMode": "quote+at",
+    "emojiReaction": 10084,
+    "emojiReactionScope": "group",
+    "fileOutPollMs": 2000,
+    "maxFileMB": 30,
+    "maxInboundFiles": 3,
+    "maxInlineTextBytes": 204800,
+    "maxQueue": 5,
+    "groupContextCount": 60,
+    "groupContextMaxChars": 500,
+    "heartbeatTimeoutMs": 90000,
+    "turnTimeoutMs": 2700000,
+    "selfHealMs": 120000,
+    "progressMinIntervalMs": 3000
+  },
+  "persona": {
+    "text": "",
+    "groupBoundary": ""
+  }
+}
