@@ -52,6 +52,7 @@ module.exports = {
   turnMemoryPrompt, migrateMemoryLayout,
   personaPrompt, envPrompt,
   fetchQuotedMessage, describeMentions, resolveMemberName, describeToolCall,
+  parseCards, fetchForwardContent, notifyTarget,
   cacheMemberName, MEMBER_NAME_CACHE, MEMBER_NAME_MAX,
   mdToPlain, stripInlineMd, splitStreamTail, isDuplicateMessage,
   get TASKS() { return TASKS; },
@@ -424,7 +425,7 @@ ok('memoryPromptFile 幂等可重写', B.memoryPromptFile('group_10001') === mf)
     s.key = 'group_10001'; s.target = { type: 'group', id: '10001' };
     s.ctx = null; s.turnCtx = { replyTo: null, atUser: null };
     s.lastCtx = { replyTo: null, atUser: null };
-    s.queue = []; s.maxQueue = 5; s.lastQueueWarn = 0; s.busy = false;
+    s.queue = []; s.maxQueue = 5; s.lastQueueWarn = 0; s.queueWarnAt = new Map(); s.busy = false;
     s.proc = null; s.closed = false; s.pending = new Map(); s.flushTimer = null;
     s.buf = ''; s.lastFlush = 0; s.lastUsed = 0; s.abortRequested = false; s.stderrTail = [];
     return s;
@@ -446,10 +447,14 @@ ok('memoryPromptFile 幂等可重写', B.memoryPromptFile('group_10001') === mf)
   ok('flush 使用本轮 ctx 快照(@111 而非 @222)', atSeg && atSeg.data.qq === '111', JSON.stringify(segs));
 
   // 队列上限
-  const s2 = mk(); s2.busy = true;
+  const s2 = mk(); s2.busy = true; s2.sendQQ = async (t) => { sent.push({ params: { message: t } }); };
   for (let i = 0; i < 20; i++) s2.prompt(`m${i}`, [], { replyTo: String(i), atUser: '1' });
   ok('队列上限生效', s2.queue.length === 5, `len=${s2.queue.length}`);
   ok('超限时回发提示', sent.some((x) => String(x.params.message).includes('排队已满')), '');
+  // 排队时也要告知位置
+  const s4 = mk(); s4.busy = true; s4.sendQQ = async (t) => { sent.push({ params: { message: t } }); };
+  s4.prompt('hi', [], { userId: '9', userName: '小明' });
+  ok('排队时告知位置', sent.some((x) => String(x.params.message).includes('已排队')), '');
   ok('队列元素保留 ctx', s2.queue[0].ctx && s2.queue[0].ctx.replyTo === '0', JSON.stringify(s2.queue[0].ctx));
 
   // ---- 群聊背景上下文
