@@ -293,7 +293,7 @@ const ok = (name, pass, extra) => { results.push({ name, pass }); console.log(`$
       lastResumeList: null,
       lastModelList: null,
       stderrTail: [],
-      beginWork() {}, endWork() {},
+      beginWork() {}, endWork() {}, isWorking() { return this.busy; },
       sendQQ: async (t) => { sent.push(String(t)); return { status: 'ok' }; },
       request: async () => ({ models: [], levels: [] }),
       historyFiles: () => [],
@@ -327,7 +327,7 @@ const ok = (name, pass, extra) => { results.push({ name, pass }); console.log(`$
       const sess = {
         key: 'private_31', busy: false, queue: [], lastResumeList: null,
         lastModelList: null, stderrTail: [], abortRequested: false,
-        beginWork() {}, endWork() {},
+        beginWork() {}, endWork() {}, isWorking() { return this.busy; },
         sendQQ: async (t) => { sent.push(String(t)); return { status: 'ok' }; },
         send: () => true,
         request: async (cmd) => {
@@ -718,6 +718,8 @@ const ok = (name, pass, extra) => { results.push({ name, pass }); console.log(`$
   }
 
   // ---- 修复 24: 静音模式不主动插话
+  // (修复 29 修正) 排队提示不再受 quietNotices 控制: 用户明确说过「这条不是噪音」。
+  // 消息被排住却一声不吽, 在用户那边和卡死没区别 —— 那才是真的噪音。
   {
     const sent = [];
     const mk = () => {
@@ -728,12 +730,12 @@ const ok = (name, pass, extra) => { results.push({ name, pass }); console.log(`$
       return s;
     };
 
-    // 静音开: 排队不提示
+    // 静音开: 排队仍然提示
     B.cfg.behavior.quietNotices = true;
     const a = mk();
     a.prompt('第一条', [], { replyTo: null, atUser: null });
     a.prompt('第二条', [], { replyTo: null, atUser: null });
-    ok('静音模式不提示排队', !sent.some((t) => t.includes('已排队')), JSON.stringify(sent));
+    ok('静音模式下排队仍提示(不算噪音)', sent.some((t) => t.includes('已排队')), JSON.stringify(sent));
     ok('静音模式下消息照样入队', a.queue.length === 1, `q=${a.queue.length}`);
 
     // 静音关: 照常提示
@@ -808,7 +810,7 @@ const ok = (name, pass, extra) => { results.push({ name, pass }); console.log(`$
     const sent = [];
     const fake = {
       key: 'private_31', busy: false, queue: [], lastResumeList: null, lastModelList: null,
-      stderrTail: [], beginWork() {}, endWork() {},
+      stderrTail: [], beginWork() {}, endWork() {}, isWorking() { return this.busy; },
       sendQQ: async (t) => { sent.push(String(t)); return { status: 'ok' }; },
       request: async () => ({ models: [], levels: [] }),
       describeModel: async () => ({
@@ -852,6 +854,68 @@ const ok = (name, pass, extra) => { results.push({ name, pass }); console.log(`$
     sent.length = 0;
     await B.dispatchCommand(fake, '/model', 'zzz', ctx);
     ok('无效参数仍给用法提示', sent.some((t) => t.includes('用法: /model')), JSON.stringify(sent));
+  }
+
+  // ---- 修复 28: 私聊永久 busy (2026-10-08 那次卡死)
+  // 形态: /compact 进行中时 pi 拒收 prompt, 桥接已经把 busy 置成 true,
+  // 又拿不到 agent_settled, 于是该会话永久「正在执行任务中」。
+  {
+    const sent = [];
+    const s = new B.PiSession('private_98', { type: 'private', id: '98' });
+    const cmds = [];
+    s.proc = { stdin: { writable: true, write: (d, cb) => { cmds.push(String(d).trim()); if (cb) cb(null); }, on: () => {} } };
+    s.sendQQ = async (t) => { sent.push(String(t)); return { status: 'ok' }; };
+    s.lastPrompt = { text: '原问题', images: [], ctx: null };
+
+    // 1) 压缩期间进来的消息必须排队, 而不是直接塞给 pi
+    s.beginWork('压缩上下文');
+    s.prompt('压缩时发的消息', [], null);
+    ok('压缩期间的消息进队列', s.queue.length === 1 && cmds.length === 0,
+      `queue=${s.queue.length} cmds=${cmds.length}`);
+    ok('压缩期间不会把 busy 置成 true', s.busy === false);
+    ok('排队时给用户一句提示', sent.some((t) => t.includes('已排队')), JSON.stringify(sent));
+    ok('isWorking 覆盖压缩中的会话', s.isWorking() === true);
+
+    // 2) 万一还是被拒: 失败响应必须把 busy 收回来, 并自动重新排队
+    sent.length = 0;
+    s.busy = true;
+    s.abortRequested = false;
+    s.onRecord({ type: 'response', id: 'req_1', command: 'prompt', success: false,
+      error: 'Cannot submit a prompt while compaction is in progress. Wait for compaction to finish and retry.' });
+    ok('被拒后 busy 被收回', s.busy === false);
+    ok('被拒后自动重新排队(队首)', s.queue.length === 2 && s.queue[0].text === '原问题',
+      `queue=${JSON.stringify(s.queue.map((q) => q.text))}`);
+    ok('被拒重试有次数上限', s.rejectRequeues === 1);
+
+    // 3) 不可重试的错误: 告诉用户, 不无限重试
+    sent.length = 0;
+    s.busy = true;
+    s.rejectRequeues = 2;
+    s.onRecord({ type: 'response', id: 'req_2', command: 'prompt', success: false,
+      error: 'Model not found: x/y' });
+    ok('非压缩类错误直接告知用户', sent.some((t) => t.includes('没能跑起来')), JSON.stringify(sent));
+    ok('非压缩类错误不再重排队', s.rejectRequeues === 0);
+
+    // 4) 压缩结束后队列要能自己排出去 (不用等下一条用户消息)
+    s.busy = false;
+    s.queue = [];
+    s.lastPrompt = null;
+    s.workLabel = '';
+    s.beginWork('压缩上下文');
+    s.prompt('压缩期间发的', [], null);
+    ok('压缩期间入队', s.queue.length === 1 && cmds.length === 0,
+      `queue=${s.queue.length} cmds=${cmds.length}`);
+    s.endWork();
+    ok('endWork 会补一次 drain', cmds.length === 1 && s.queue.length === 0,
+      `cmds=${cmds.length} queue=${s.queue.length}`);
+    s.busy = false;
+    s.workLabel = '';
+
+    // 5) 被拒响应不能影响正常的 pending 请求
+    let resolved = null;
+    s.pending.set('req_x', { resolve: (d) => { resolved = d; }, reject: () => {}, timer: setTimeout(() => {}, 0) });
+    s.onRecord({ type: 'response', id: 'req_x', command: 'get_state', success: true, data: { ok: 1 } });
+    ok('pending 的正常响应仍被派发', resolved && resolved.ok === 1);
   }
 
   console.log('\n===== 结果 =====');

@@ -854,6 +854,49 @@ class PiSession {
     }
   }
 
+  /**
+   * 兜住「不在 pending 里」的失败响应 (目前只有 prompt / steer 走这条路)。
+   * 两者都会把会话留在错误状态里: prompt 的 busy 是桥接自己置的, pi 根本没开始跑,
+   * 不在这里收回来, 用户看到的就是永久的「当前任务执行中」。
+   */
+  onUntrackedFailure(rec) {
+    const cmd = rec.command || '?';
+    const msg = String(rec.error || '未知错误');
+    warn(`[${this.key}] pi 拒绝了 ${cmd}: ${msg}`);
+    if (cmd === 'prompt') {
+      const wasBusy = this.busy;
+      this.busy = false;
+      this.abortRequested = false;
+      this.lastEventAt = Date.now();
+      if (wasBusy) {
+        const tries = this.rejectRequeues || 0;
+        // 「压缩中」是可恢复的: 把消息放回队首, 等压缩结束再跑一次。
+        // 其他原因(模型不存在 / 参数错误)重试只会再错一遍, 直接告诉用户。
+        const retryable = /compact/i.test(msg);
+        if (retryable && tries < 2 && this.lastPrompt) {
+          this.rejectRequeues = tries + 1;
+          this.queue.unshift(this.lastPrompt);
+          log(`[${this.key}] prompt 被拒(压缩中), 已重新排队 (第 ${this.rejectRequeues} 次)`);
+          const t = setTimeout(() => { if (!this.closed) this.drainQueue(); }, 2000);
+          if (t.unref) t.unref();
+        } else {
+          this.rejectRequeues = 0;
+          this.sendQQ(`❌ 这条消息没能跑起来：${msg}`, { plain: true }).catch(() => {});
+        }
+      }
+      // 顺序很重要: 先 busy=false 再 drain, 否则队列永远排不出去
+      if (!this.retryPending) this.drainQueue();
+      maybeRestartNow();
+      return;
+    }
+    if (cmd === 'steer') {
+      this.sendQQ(`⚠️ 插话没生效：${msg}`, { plain: true }).catch(() => {});
+      return;
+    }
+    // 其余命令(compact / new_session / set_model …)都由 request() 等着响应,
+    // 正常走不到这里; 真走到了也只记日志, 不拿技术错误打扰用户。
+  }
+
   onRecord(rec) {
     this.lastEventAt = Date.now();
     // 高频路径: 关掉 debug 时不要构建模板字符串 (text_delta 一次回复几百条)
@@ -864,6 +907,15 @@ class PiSession {
       clearTimeout(timer);
       if (rec.success) resolve(rec.data);
       else reject(new Error(rec.error || 'pi 命令失败'));
+      return;
+    }
+    // pi 对每条命令都会回一个 response。走 send() 的「发射后不管」命令 (prompt / steer)
+    // 不在 pending 里, 于是它们的失败响应以前被直接丢弃 —— 2026-10-08 那次「私聊卡死」
+    // 就是这么来的: /compact 期间 pi 拒收 prompt (Cannot submit a prompt while
+    // compaction is in progress), 而桥接在发出去之前就已经乐观地把 busy 置成了 true,
+    // 于是永远等不到 agent_settled, 该会话永久 busy, 后续消息只排队、不处理。
+    if (rec.type === 'response' && rec.success === false && !this.pending.has(rec.id)) {
+      this.onUntrackedFailure(rec);
       return;
     }
     switch (rec.type) {
@@ -987,6 +1039,7 @@ class PiSession {
           this.emptyRetries = 0;   // 正常出话就清零
         }
         this.abortRequested = false;
+        this.rejectRequeues = 0;   // 这一轮正常结束了, 被拒重试的计数清零
         this.lastUsed = Date.now();
         this.stderrTail = [];
         // 重试已排上时先别 drain: 否则队列里的消息会抢在重试前面跑,
@@ -1094,6 +1147,18 @@ class PiSession {
   endWork() {
     this.workLabel = '';
     this.workSince = 0;
+    // 长操作期间进来的消息都堆在 queue 里, 这里补一次 drain —— 否则要等到下一条
+    // 用户消息才会被处理。drainQueue 自己在 busy / 仍在工作时会直接返回。
+    this.drainQueue();
+  }
+
+  /**
+   * 「正忙」的统一定义: 正在跑一轮对话, 或者正在跑一个耗时的非 prompt 操作
+   * (压缩上下文 / 切换会话 / 开启新会话)。命令守卫必须用它 ——
+   * 只看 busy 会让 /compact 期间敲进来的命令和压缩流程打架。
+   */
+  isWorking() {
+    return this.busy || !!this.workLabel;
   }
 
   send(cmd) {
@@ -1129,7 +1194,7 @@ class PiSession {
       );
       if (prefix) message = `${prefix}\n\n${text}`;
     }
-    if (this.busy) {
+    if (this.busy || this.workLabel) {
       // 群里多人同时问时, 排队的人应该知道自己排到了哪 —— 否则只会觉得"没反应"。
       // 同一个人只提示一次(10 秒内不重复), 避免连发几条时刷屏。
       const now = Date.now();
@@ -1158,11 +1223,11 @@ class PiSession {
         return;
       }
       this.queue.push({ text, images, ctx });
-      // 静音模式下不提示排队: 用户只想要正文, 排队提示属于噪音。
-      // 但「排队已满」那条保留 —— 那是消息真的被丢了, 必须让人知道。
-      if (!cfg.behavior.quietNotices) {
-        warnOnce('queued', `⏳ 前面还有 ${this.queue.length} 条在处理，你这条已排队。`);
-      }
+      // 排队提示不跟 quietNotices 走: 用户明确说过「这条不是噪音」。
+      // 消息被排住却一声不吭, 在用户那边和卡死没有区别 —— 那才是真的噪音。
+      warnOnce('queued', this.workLabel
+        ? `⏳ 正在${this.workLabel}，你这条已排队，好了就回。`
+        : `⏳ 前面还有 ${this.queue.length} 条在处理，你这条已排队。`);
       return;
     }
     this.busy = true;
@@ -1214,7 +1279,7 @@ class PiSession {
   }
 
   drainQueue() {
-    if (this.busy || !this.queue.length) return;
+    if (this.busy || this.workLabel || !this.queue.length) return;
     const next = this.queue.shift();
     this.prompt(next.text, next.images, next.ctx);
   }
@@ -1537,6 +1602,9 @@ const onebot = {
             notice = '🟢 pi-qq 桥接已上线';
           }
           if (notice) {
+            // 这条走的是裸 action, 不经 sendQQ, 所以必须自己记一笔 ——
+            // 否则「到底发没发」只能去翻 NapCat 的日志, 排查时很别扭。
+            log(`启动通知已发出: ${notice.split('\n')[0]}`);
             for (const id of PRIVATE_ALLOW) {
               this.action('send_private_msg', { user_id: Number(id), message: notice }).catch(() => {});
             }
@@ -2773,7 +2841,7 @@ async function dispatchCommand(session, cmd, arg, ctx) {
   if (cmd === '/help' || cmd === '帮助') { await session.sendQQ(HELP); return true; }
 
   if (cmd === '/new') {
-    if (session.busy) { await session.sendQQ('⏳ 当前任务执行中，请先 /stop。'); return true; }
+    if (session.isWorking()) { await session.sendQQ('⏳ 当前任务执行中，请先 /stop。'); return true; }
     try {
       session.beginWork('开启新会话');
       const file = await session.newSession();
@@ -2790,7 +2858,7 @@ async function dispatchCommand(session, cmd, arg, ctx) {
   }
 
   if (cmd === '/resume') {
-    if (session.busy) { await session.sendQQ('⏳ 当前任务执行中，请先 /stop。'); return true; }
+    if (session.isWorking()) { await session.sendQQ('⏳ 当前任务执行中，请先 /stop。'); return true; }
     const files = session.historyFiles();
     if (!files.length) { await session.sendQQ('📭 没有可恢复的历史会话。'); return true; }
     const limit = Math.min(files.length, 10);
@@ -2822,7 +2890,7 @@ async function dispatchCommand(session, cmd, arg, ctx) {
   }
 
   if (cmd === '/model') {
-    if (session.busy) { await session.sendQQ('⏳ 当前任务执行中，请先 /stop。'); return true; }
+    if (session.isWorking()) { await session.sendQQ('⏳ 当前任务执行中，请先 /stop。'); return true; }
     try {
       const d = await session.describeModel();
       if (!arg) {
@@ -2873,7 +2941,7 @@ async function dispatchCommand(session, cmd, arg, ctx) {
   }
 
   if (THINK_ALIAS.has(cmd)) {
-    if (session.busy) { await session.sendQQ('⏳ 当前任务执行中，请先 /stop。'); return true; }
+    if (session.isWorking()) { await session.sendQQ('⏳ 当前任务执行中，请先 /stop。'); return true; }
     try {
       const d = await session.describeModel();
       if (!arg) {
@@ -2930,7 +2998,7 @@ async function dispatchCommand(session, cmd, arg, ctx) {
   }
 
   if (cmd === '/compact') {
-    if (session.busy) { await session.sendQQ('⏳ 当前任务执行中，请先 /stop。'); return true; }
+    if (session.isWorking()) { await session.sendQQ('⏳ 当前任务执行中，请先 /stop。'); return true; }
     try {
       await session.sendQQ('🗜️ 正在压缩上下文，请稍候…', { plain: true });
       const payload = { type: 'compact' };
@@ -3074,6 +3142,9 @@ async function dispatchCommand(session, cmd, arg, ctx) {
       session.retryPending = false;
     }
     session.send({ type: 'abort', id: `abort-${Date.now()}` });
+    // pi 那边可能还留着排队的消息(follow_up / 压缩期间排入的), 一起清掉 ——
+    // 否则用户按了 /stop 之后还会收到一条「叫停前那条消息」的回复。
+    session.send({ type: 'clear_queue', id: `clearq-${Date.now()}` });
     session.queue = [];
     await session.sendQQ('🛑 已请求中断。');
   return true;
@@ -3448,7 +3519,8 @@ function setExitHook(fn) { exitHook = fn || null; }
 function busySessionCount() {
   // retryPending 也算忙: 那个会话 500ms 后还要重发一次, 现在重启会把重试吞掉
   let n = 0;
-  for (const [, s] of sessions) if (s.busy || s.retryPending) n++;
+  // workLabel 也要算: 压缩上下文这类长操作期间重启, 会把压缩流程拦腰砍断
+  for (const [, s] of sessions) if (s.busy || s.retryPending || s.workLabel) n++;
   return n;
 }
 
