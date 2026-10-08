@@ -30,7 +30,7 @@ fs.writeFileSync(path.join(BASE, 'config.json'), JSON.stringify({
 
 const src = fs.readFileSync(path.join(__dirname, 'bridge.js'), 'utf8');
 fs.writeFileSync(path.join(BASE, 'bridge.js'), `${src}
-module.exports = { PiSession, sessions, alertTarget, cfg, onebot, fetchGroupContext, GROUP_CTX_CACHE };
+module.exports = { PiSession, sessions, alertTarget, cfg, onebot, fetchGroupContext, GROUP_CTX_CACHE, sweepStorage, STATE, dispatchCommand, HELP };
 `);
 
 const results = [];
@@ -194,6 +194,195 @@ const ok = (name, pass, extra) => { results.push({ name, pass }); console.log(`$
     s.endWork();
     ok('endWork 清除工作标记', !s.workLabel);
     s.closed = true;
+  }
+
+  // ---- 修复 8: spawn 失败 / 快速崩溃的退避重启
+  {
+    const s = new B.PiSession('private_20', { type: 'private', id: '20' });
+    s.closed = false;
+    s.sendQQ = async () => ({ status: 'ok' });   // 别真发
+
+    // 刚启动就死 => 算快速失败, 计数递增, 延迟递增
+    const delays = [];
+    for (let i = 1; i <= 4; i++) {
+      s.spawnedAt = Date.now() - 100;          // 只活了 0.1 秒
+      s.spawnFailures = i - 1;
+      s.proc = null;
+      if (s.respawnTimer) { clearTimeout(s.respawnTimer); s.respawnTimer = null; }
+      s.scheduleRespawn('测试');
+      delays.push(s.spawnFailures);
+    }
+    ok('快速失败会累加计数', delays.join(',') === '1,2,3,4', `counts=${delays.join(',')}`);
+    if (s.respawnTimer) { clearTimeout(s.respawnTimer); s.respawnTimer = null; }
+
+    // 存活够久 => 计数归零
+    s.spawnFailures = 5;
+    s.spawnedAt = Date.now() - 60000;          // 活了 1 分钟
+    if (s.respawnTimer) { clearTimeout(s.respawnTimer); s.respawnTimer = null; }
+    s.scheduleRespawn('测试');
+    ok('存活够久后计数归零', s.spawnFailures === 0, `n=${s.spawnFailures}`);
+    if (s.respawnTimer) clearTimeout(s.respawnTimer);
+
+    // closed 会话不再排重启
+    s.closed = true;
+    s.spawnedAt = Date.now() - 100;
+    if (s.respawnTimer) { clearTimeout(s.respawnTimer); s.respawnTimer = null; }
+    s.scheduleRespawn('测试');
+    ok('已销毁的会话不再安排重启', !s.respawnTimer);
+  }
+
+  // ---- 修复 9: destroy 会取消已排上的重启
+  {
+    const s = new B.PiSession('private_21', { type: 'private', id: '21' });
+    s.proc = { stdin: { writable: true, write: (d, cb) => { if (cb) cb(null); }, end() {}, on: () => {} }, kill() {} };
+    s.spawnedAt = Date.now() - 100;
+    s.scheduleRespawn('测试');
+    ok('重启已排上', !!s.respawnTimer);
+    await s.destroy('test');
+    ok('destroy 会取消重启定时器', !s.respawnTimer);
+  }
+
+  // ---- 修复 10: 磁盘回收只删过期的、未引用的文件
+  {
+    const fsx = require('fs');
+    const sessDir = B.cfg.pi.sessionDir;
+    const inboxDir = B.cfg.files.inboxDir;
+    const now = Date.now();
+    const old = new Date(now - 40 * 24 * 3600 * 1000);
+    const fresh = new Date(now - 1 * 24 * 3600 * 1000);
+
+    // 造三个会话文件: 旧的未引用(应删) / 旧的但被引用(应留) / 新的未引用(应留)
+    const fOld = `${sessDir}/2020-01-01T00-00-00-000Z_orphan.jsonl`;
+    const fRef = `${sessDir}/2020-01-02T00-00-00-000Z_referenced.jsonl`;
+    const fNew = `${sessDir}/2020-01-03T00-00-00-000Z_new.jsonl`;
+    for (const f of [fOld, fRef, fNew]) fsx.writeFileSync(f, 'x');
+    fsx.utimesSync(fOld, old, old);
+    fsx.utimesSync(fRef, old, old);
+    fsx.utimesSync(fNew, fresh, fresh);
+    // 让 fRef 被 state 引用
+    B.STATE.__test_ref__ = { sessionFile: fRef, spawnId: 'x', history: [] };
+
+    // inbox: 旧文件应删, 新文件应留
+    const iOld = `${inboxDir}/old_file.txt`;
+    const iNew = `${inboxDir}/new_file.txt`;
+    fsx.writeFileSync(iOld, 'y'); fsx.writeFileSync(iNew, 'y');
+    fsx.utimesSync(iOld, old, old); fsx.utimesSync(iNew, fresh, fresh);
+
+    B.cfg.behavior.sessionRetentionDays = 30;
+    B.cfg.behavior.inboxRetentionDays = 7;
+    await B.sweepStorage();
+
+    ok('删掉过期且未被引用的会话文件', !fsx.existsSync(fOld));
+    ok('保留被 state 引用的会话文件', fsx.existsSync(fRef));
+    ok('保留未过期的会话文件', fsx.existsSync(fNew));
+    ok('删掉过期 inbox 文件', !fsx.existsSync(iOld));
+    ok('保留未过期 inbox 文件', fsx.existsSync(iNew));
+
+    delete B.STATE.__test_ref__;
+    for (const f of [fRef, fNew]) { try { fsx.unlinkSync(f); } catch {} }
+    for (const f of [iNew]) { try { fsx.unlinkSync(f); } catch {} }
+  }
+
+  // ---- 修复 11: dispatchCommand 拆分后行为不变
+  {
+    const sent = [];
+    const fake = {
+      key: 'private_30',
+      busy: false,
+      queue: [],
+      lastResumeList: null,
+      lastModelList: null,
+      stderrTail: [],
+      beginWork() {}, endWork() {},
+      sendQQ: async (t) => { sent.push(String(t)); return { status: 'ok' }; },
+      request: async () => ({ models: [], levels: [] }),
+      historyFiles: () => [],
+      send: () => true,
+      abortRequested: false,
+    };
+    const ctx = { isGroup: false, userId: '123456789', groupId: '', userName: '主人', key: 'private_30' };
+
+    // 非命令: 必须返回 false, 让调用方继续走对话流程
+    for (const t of ['你好', '帮我看看', '', '//斜杠', '命令']) {
+      const r = await B.dispatchCommand(fake, t.toLowerCase(), '', ctx);
+      ok(`非命令「${t}」返回 false`, r === false, `got=${r}`);
+    }
+    // /help: 应返回 true 并发出帮助文本
+    sent.length = 0;
+    const rHelp = await B.dispatchCommand(fake, '/help', '', ctx);
+    ok('/help 返回 true', rHelp === true);
+    ok('/help 发出了帮助文本', sent.some((t) => t.includes('pi coding agent')), `sent=${sent.length}`);
+    // 帮助文本不该含 Markdown 围栏
+    ok('帮助文本不含三反引号', !sent.join('').includes('```'));
+    // /queue 空闲时提示
+    sent.length = 0;
+    const rQ = await B.dispatchCommand(fake, '/queue', '', ctx);
+    ok('/queue 返回 true 且有提示', rQ === true && sent.some((t) => t.includes('没有排队')), `ret=${rQ} sent=${JSON.stringify(sent).slice(0,200)}`);
+  }
+
+  // ---- 修复 12: 所有内置命令都必须返回 true, 漏一个就会穿透到模型
+  {
+    const mk = (over = {}) => {
+      const sent = [];
+      const sess = {
+        key: 'private_31', busy: false, queue: [], lastResumeList: null,
+        lastModelList: null, stderrTail: [], abortRequested: false,
+        beginWork() {}, endWork() {},
+        sendQQ: async (t) => { sent.push(String(t)); return { status: 'ok' }; },
+        send: () => true,
+        request: async (cmd) => {
+          if (cmd.type === 'get_available_models') return { models: [{ provider: 'p', id: 'm' }] };
+          if (cmd.type === 'get_available_thinking_levels') return { levels: ['low', 'high'] };
+          if (cmd.type === 'get_session_stats') return { tokens: {}, contextUsage: {} };
+          if (cmd.type === 'get_state') return { model: { provider: 'p', id: 'm' }, thinkingLevel: 'high', messageCount: 1 };
+          return {};
+        },
+        historyFiles: () => ['/tmp/nope.jsonl'],
+        newSession: async () => '/tmp/new.jsonl',
+        switchTo: async () => '/tmp/sw.jsonl',
+        setModel: async () => ({ model: { provider: 'p', id: 'm' }, thinkingLevel: 'high', levels: ['low'] }),
+        setThinking: async () => 'low',
+        prompt: () => {},
+        ...over,
+      };
+      return { sess, sent };
+    };
+    const ctx = { isGroup: false, userId: '123456789', groupId: '', userName: '主人', key: 'private_31' };
+
+    // 这些命令在「正常参数」下都必须返回 true
+    const cases = [
+      ['/help', ''],
+      ['/new', ''],
+      ['/resume', ''],
+      ['/model', ''],
+      ['/model', '1'],
+      ['/model', 'p/m'],
+      ['/thinking', ''],
+      ['/thinking', 'low'],
+      ['/stats', ''],
+      ['/compact', ''],
+      ['/memory', ''],
+      ['/task', ''],
+      ['/queue', ''],
+      ['/steer', '加点东西'],
+      ['/stop', ''],
+      ['/status', ''],
+      ['/reset', ''],
+    ];
+    for (const [c, a] of cases) {
+      const { sess } = mk({ destroy: async () => {}, syncSessionFile: async () => {} });
+      let r;
+      try { r = await B.dispatchCommand(sess, c, a, ctx); }
+      catch (e) { r = `throw:${e.message}`; }
+      ok(`${c}${a ? ' ' + a : ''} 返回 true`, r === true, `got=${r}`);
+    }
+    // 未知命令必须返回 false
+    const { sess: s2 } = mk();
+    ok('/nonsense 返回 false', (await B.dispatchCommand(s2, '/nonsense', '', ctx)) === false);
+    // 群里 /restart 被拒绝, 但仍算已消费
+    const { sess: s3 } = mk();
+    ok('群聊 /restart 被拒绝但返回 true',
+      (await B.dispatchCommand(s3, '/restart', '', { ...ctx, isGroup: true })) === true);
   }
 
   console.log('\n===== 结果 =====');

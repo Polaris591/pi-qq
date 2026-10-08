@@ -173,8 +173,20 @@ function toContainerPath(hostPath) {
   return path.join(OUTBOX_CTR, rel).split(path.sep).join('/');
 }
 
-const log = (...a) => console.log(new Date().toISOString(), ...a);
-const warn = (...a) => console.error(new Date().toISOString(), ...a);
+// 日志分级。之前只有 log/warn 两个级别, 排查问题时分不清「正常信息」和「出事了」:
+//   error 只给真正的故障 (进程死、发送失败)
+//   warn  需要你注意但不影响运行
+//   info  正常的生命周期事件
+//   debug 只有在 PI_QQ_DEBUG=1 时才输出, 平时不刷屏
+// 统一用 [级别] 前缀, 方便 journalctl | grep '\[error\]' 直接筛。
+const LOG_LEVEL = String(process.env.PI_QQ_LOG || (process.env.PI_QQ_DEBUG ? 'debug' : 'info')).toLowerCase();
+const LEVELS = { error: 0, warn: 1, info: 2, debug: 3 };
+const LOG_MIN = LEVELS[LOG_LEVEL] === undefined ? LEVELS.info : LEVELS[LOG_LEVEL];
+const ts = () => new Date().toISOString();
+const log = (...a) => { if (LOG_MIN >= LEVELS.info) console.log(ts(), '[info]', ...a); };
+const warn = (...a) => { if (LOG_MIN >= LEVELS.warn) console.error(ts(), '[warn]', ...a); };
+const error = (...a) => { if (LOG_MIN >= LEVELS.error) console.error(ts(), '[error]', ...a); };
+const debug = (...a) => { if (LOG_MIN >= LEVELS.debug) console.log(ts(), '[debug]', ...a); };
 
 // ---------------------------------------------------------------- systemd 集成
 
@@ -618,6 +630,9 @@ class PiSession {
     this.lastEventAt = Date.now();   // 单轮看门狗用: 最近一次收到 pi 事件的时刻
     this.toolStarted = new Map();    // toolCallId -> 开始时刻 (进度提示用)
     this.lastToolNoticeAt = 0;       // 上次工具进度提示的时刻 (节流用)
+    this.spawnedAt = 0;              // 本次 pi 子进程的启动时刻 (退避判断用)
+    this.spawnFailures = 0;          // 连续快速失败次数
+    this.respawnTimer = null;
     if (this.ephemeral) {
       // 任务会话: 每次执行都是全新上下文, 不污染用户当前会话
       this.spawnId = `${slug(key)}-task-${Date.now().toString(36)}`;
@@ -725,6 +740,7 @@ class PiSession {
     if (Array.isArray(cfg.pi.extraArgs)) args.push(...cfg.pi.extraArgs);
 
     log(`[${this.key}] spawn: ${cfg.pi.bin} ${args.join(' ')}`);
+    this.spawnedAt = Date.now();
     this.proc = spawn(cfg.pi.bin, args, {
       cwd: cfg.pi.cwd,
       // NOTIFY_SOCKET 不能传给 pi: 服务已设 NotifyAccess=all, 否则 pi 里任何
@@ -745,8 +761,14 @@ class PiSession {
       if (this.stderrTail.length > 40) this.stderrTail.shift();
       warn(`[${this.key}] pi stderr: ${s.trimEnd()}`);
     });
-    this.proc.on('exit', (code, sig) => {
-      warn(`[${this.key}] pi 退出 code=${code} sig=${sig}`);
+    // 一个子进程只能被处理一次。'exit' 与 'error' 都可能到达, 不能各排一次重启。
+    // 另外 spawn 失败时 Node 只发 'error' + 'close', 不发 'exit' —— 旧代码只监听
+    // 'exit', 所以二进制缺失/环境坏了会导致会话永久死掉, 既不重启也不通知。
+    let dead = false;
+    const onDead = (why, detail) => {
+      if (dead) return;
+      dead = true;
+      error(`[${this.key}] pi ${why}${detail ? ` ${detail}` : ''}`);
       this.proc = null;
       if (this.busy) {
         this.busy = false;
@@ -757,16 +779,44 @@ class PiSession {
         this.sendQQ('⚠️ pi 进程意外退出，会话已重置。', { plain: true })
           .catch((e) => warn(`[${this.key}] 退出提示发送失败: ${e.message}`));
       }
-      if (!this.closed) {
-        setTimeout(() => {
-          this.spawnProc();
-          this.syncSessionFile();
-        }, 3000);
-      }
-    });
-    this.proc.on('error', (e) => {
-      warn(`[${this.key}] pi 启动失败: ${e.message}`);
-    });
+      this.scheduleRespawn(why);
+    };
+    this.proc.on('exit', (code, sig) => onDead('退出', `code=${code} sig=${sig}`));
+    this.proc.on('error', (e) => onDead('启动失败', e.message));
+    // 'close' 是最后的兔底: 某些平台/情况下 'exit' 可能不到, 'close' 一定会到
+    this.proc.on('close', () => onDead('连接关闭'));
+  }
+
+  /**
+   * 安排重启, 带指数退避。
+   *
+   * 旧实现固定 3 秒重拉: 如果 pi 一启动就挂(配置错、鉴权失败、二进制被换掉),
+   * 就是每 3 秒无限重启 —— 日志刷屏、烧 CPU, 而且你完全看不出来。
+   * 现在: 存活不足 10 秒算「启动失败」, 失败次数越多等得越久(3s/6s/12s…封顶 5 分钟),
+   * 并且会在第 3 次时主动告诉你。一旦成功存活超过 10 秒, 计数归零。
+   */
+  scheduleRespawn(why) {
+    if (this.closed) return;
+    const alive = Date.now() - (this.spawnedAt || 0);
+    const QUICK_MS = Math.max(1000, Number(cfg.behavior.spawnQuickExitMs) || 10000);
+    if (alive < QUICK_MS) this.spawnFailures = (this.spawnFailures || 0) + 1;
+    else this.spawnFailures = 0;
+    const n = this.spawnFailures;
+    const MAX_MS = Math.max(5000, Number(cfg.behavior.spawnMaxBackoffMs) || 5 * 60 * 1000);
+    const delay = n <= 1 ? 3000 : Math.min(MAX_MS, 3000 * 2 ** (n - 1));
+    if (n === 3) {
+      // 只提醒一次, 避免刷屏
+      this.sendQQ(`⚠️ pi 连续 ${n} 次启动失败（${why}），我会继续重试但间隔会拉长。`,
+        { plain: true }).catch(() => {});
+    }
+    if (this.respawnTimer) clearTimeout(this.respawnTimer);
+    this.respawnTimer = setTimeout(() => {
+      this.respawnTimer = null;
+      if (this.closed) return;
+      this.spawnProc();
+      this.syncSessionFile();
+    }, delay);
+    warn(`[${this.key}] ${Math.round(delay / 1000)}s 后重启 pi (连续失败 ${n} 次)`);
   }
 
   onStdout(chunk) {
@@ -786,6 +836,7 @@ class PiSession {
 
   onRecord(rec) {
     this.lastEventAt = Date.now();
+    debug(`[${this.key}] <- pi: ${rec.type}${rec.type === 'message_update' ? `/${(rec.assistantMessageEvent || {}).type || '?'}` : ''}`);
     if (rec.type === 'response' && rec.id && this.pending.has(rec.id)) {
       const { resolve, reject, timer } = this.pending.get(rec.id);
       this.pending.delete(rec.id);
@@ -904,7 +955,7 @@ class PiSession {
     const parts = splitForQQ(text, cfg.behavior.maxChars);
     for (let i = 0; i < parts.length; i++) {
       await this.sendQQ(parts[i], { first: i === 0, ctx: c })
-        .catch((e) => warn(`[${this.key}] 发送失败: ${e.message}`));
+        .catch((e) => error(`[${this.key}] 发送失败: ${e.message}`));
       await sleep(350);
     }
   }
@@ -921,6 +972,9 @@ class PiSession {
     if (!body) return;
     // 记下「刚给用户发过东西」, 供静默提醒计时
     this.lastOutputAt = Date.now();
+    // 出向消息也记一条。之前只有入向 ("<- xxx") 有日志, 排查「到底发出去了什么」
+    // 时完全没有依据 —— 出问题只能猜。截断到 120 字避免刷屏。
+    log(`[${this.key}] -> ${body.replace(/\s+/g, ' ').slice(0, 120)}${body.length > 120 ? '…' : ''}`);
     const o = { ...(opts.ctx || this.ctx || this.lastCtx), ...opts };
     if (this.target.type !== 'group') {
       return onebot.action('send_private_msg', { user_id: Number(this.target.id), message: body });
@@ -984,11 +1038,12 @@ class PiSession {
       // 进而变成 uncaughtException -> fatal() -> 整个桥接退出。
       // 而这里恰恰是 pi 刚崩溃、管道已关时最容易踩到的地方。
       p.stdin.write(`${JSON.stringify(cmd)}\n`, (err) => {
-        if (err) warn(`[${this.key}] 写入 pi stdin 失败: ${err.message}`);
+        if (err) error(`[${this.key}] 写入 pi stdin 失败: ${err.message}`);
       });
+      debug(`[${this.key}] -> pi: ${cmd.type}${cmd.id ? ` id=${cmd.id}` : ''}`);
       return true;
     } catch (e) {
-      warn(`[${this.key}] 写入 pi stdin 异常: ${e.message}`);
+      error(`[${this.key}] 写入 pi stdin 异常: ${e.message}`);
       return false;
     }
   }
@@ -1173,6 +1228,8 @@ class PiSession {
     if (this.closed) return;   // 幂等: 重复调用不再二次 kill
     this.closed = true;
     if (this.flushTimer) { clearTimeout(this.flushTimer); this.flushTimer = null; }
+    // 退避重启可能已经排上了, 必须取消, 否则会话销毁后进程又自己回来了
+    if (this.respawnTimer) { clearTimeout(this.respawnTimer); this.respawnTimer = null; }
     // 排队中的消息一旦丢弃就永远没了, 必须告诉用户, 否则他以为排上了其实石沉大海。
     // 触发场景: 闲置 30 分钟回收 / LRU 淘汰 / /reset / 关闭服务。
     // 关闭服务时不发: 进程马上退出, 消息发不出去, 只会多一条 unhandled rejection
@@ -2475,309 +2532,13 @@ async function handleIncoming(rec) {
     }).catch((e) => warn(`贴表情失败: ${e.message}`));
   }
 
-  // ---- 内置命令
+  // ---- 内置命令: 命中就直接结束, 没命中返回 false 继续走对话流程
   const [c0, ...cmdArgs] = text.trim().split(/\s+/);
   const cmd = c0.toLowerCase();
   const arg = cmdArgs.join(' ').trim();
+  const cmdCtx = { isGroup, userId, groupId, userName, key };
+  if (await dispatchCommand(session, cmd, arg, cmdCtx)) return;
 
-  if (cmd === '/help' || cmd === '帮助') { await session.sendQQ(HELP); return; }
-
-  if (cmd === '/new') {
-    if (session.busy) { await session.sendQQ('⏳ 当前任务执行中，请先 /stop。'); return; }
-    try {
-      session.beginWork('开启新会话');
-      const file = await session.newSession();
-      const d = await session.describeModel();
-      await session.sendQQ([
-        '🆕 已开启新会话。',
-        `模型: ${d.model ? `${d.model.provider}/${d.model.id}` : '未选择'}`,
-        `思考: ${d.thinkingLevel || '-'}`,
-        file ? `文件: ${path.basename(file)}` : '',
-      ].filter(Boolean).join('\n'));
-    } catch (e) { await session.sendQQ(`❌ 开启新会话失败: ${e.message}`); }
-    finally { session.endWork(); }
-    return;
-  }
-
-  if (cmd === '/resume') {
-    if (session.busy) { await session.sendQQ('⏳ 当前任务执行中，请先 /stop。'); return; }
-    const files = session.historyFiles();
-    if (!files.length) { await session.sendQQ('📭 没有可恢复的历史会话。'); return; }
-    const limit = Math.min(files.length, 10);
-    session.lastResumeList = files.slice(0, limit);
-    if (!arg) {
-      const lines = session.lastResumeList.map((f, i) => {
-        const s = readSessionSummary(f);
-        const cur = f === session.sessionFile ? ' ← 当前' : '';
-        return `${i + 1}. [${s.time}] ${s.title} (${s.size})${cur}`;
-      });
-      await session.sendQQ(`📚 历史会话（/resume 序号 选择）\n${lines.join('\n')}`);
-      return;
-    }
-    const idx = pickIndex(arg, session.lastResumeList.length);
-    if (idx === null) { await session.sendQQ(`⚠️ 序号需在 1-${session.lastResumeList.length} 之间。`); return; }
-    try {
-      session.beginWork('恢复会话');
-      const file = await session.switchTo(session.lastResumeList[idx]);
-      const d = await session.describeModel();
-      await session.sendQQ([
-        '📂 已恢复会话。',
-        `标题: ${readSessionSummary(file).title}`,
-        `模型: ${d.model ? `${d.model.provider}/${d.model.id}` : '未选择'}`,
-        `思考: ${d.thinkingLevel || '-'}`,
-      ].join('\n'));
-    } catch (e) { await session.sendQQ(`❌ 恢复会话失败: ${e.message}`); }
-    finally { session.endWork(); }
-    return;
-  }
-
-  if (cmd === '/model') {
-    if (session.busy) { await session.sendQQ('⏳ 当前任务执行中，请先 /stop。'); return; }
-    try {
-      const d = await session.describeModel();
-      if (!arg) {
-        const r = await session.request({ type: 'get_available_models' });
-        const models = (r && r.models) || [];
-        session.lastModelList = models;
-        if (!models.length) { await session.sendQQ('📭 没有可用模型。'); return; }
-        const cur = d.model ? `${d.model.provider}/${d.model.id}` : '';
-        const lines = models.map((m, i) => {
-          const tag = `${m.provider}/${m.id}` === cur ? ' ← 当前' : '';
-          return `${i + 1}. ${m.provider}/${m.id}${tag}`;
-        });
-        await session.sendQQ(`🧠 可用模型（/model 序号 选择）\n${lines.join('\n')}`);
-        return;
-      }
-      let target = null;
-      // 允许直接 /model 3 而无需先列表
-      if (!session.lastModelList && /^\d+$/.test(arg)) {
-        const r = await session.request({ type: 'get_available_models' });
-        session.lastModelList = (r && r.models) || [];
-      }
-      const idx = pickIndex(arg, (session.lastModelList || []).length);
-      if (idx !== null) target = session.lastModelList[idx];
-      else if (arg.includes('/')) {
-        const i = arg.indexOf('/');
-        target = { provider: arg.slice(0, i), id: arg.slice(i + 1) };
-      }
-      if (!target) { await session.sendQQ('⚠️ 用法: /model 或 /model 序号 或 /model provider/model'); return; }
-      const after = await session.setModel(target.provider, target.id);
-      await session.sendQQ([
-        `🧠 已切换模型: ${after.model ? `${after.model.provider}/${after.model.id}` : `${target.provider}/${target.id}`}`,
-        `思考: ${after.thinkingLevel || '-'}${after.levels.length ? `（可选 ${after.levels.join('/')}）` : ''}`,
-      ].join('\n'));
-    } catch (e) { await session.sendQQ(`❌ 切换模型失败: ${e.message}`); }
-    return;
-  }
-
-  if (THINK_ALIAS.has(cmd)) {
-    if (session.busy) { await session.sendQQ('⏳ 当前任务执行中，请先 /stop。'); return; }
-    try {
-      const d = await session.describeModel();
-      if (!arg) {
-        await session.sendQQ([
-          `🧩 当前思考等级: ${d.thinkingLevel || '-'}`,
-          d.levels.length ? `可选: ${d.levels.join(' / ')}` : '当前模型不支持思考等级设置。',
-          d.levels.length ? '用法: /thinking <等级>' : '',
-        ].filter(Boolean).join('\n'));
-        return;
-      }
-      const level = arg.toLowerCase();
-      if (d.levels.length && !d.levels.includes(level)) {
-        await session.sendQQ(`⚠️ 该模型仅支持: ${d.levels.join(' / ')}`);
-        return;
-      }
-      const real = await session.setThinking(level);
-      if (real !== level) {
-        await session.sendQQ(`⚠️ 设置未生效，当前仍为 ${real || '-'}${d.levels.length ? `（可选 ${d.levels.join('/')}）` : ''}`);
-        return;
-      }
-      await session.sendQQ(`🧩 思考等级已设为 ${real}`);
-    } catch (e) { await session.sendQQ(`❌ 设置思考等级失败: ${e.message}`); }
-    return;
-  }
-
-  if (cmd === '/stats') {
-    try {
-      const s = await session.request({ type: 'get_session_stats' });
-      const t = s.tokens || {};
-      const c = s.contextUsage || {};
-      const fmt = (n) => (n == null ? '-' : Number(n).toLocaleString('en-US'));
-      const pct = c.percent == null ? null : c.percent;
-      const barLen = 12;
-      const filled = pct == null ? 0 : Math.min(barLen, Math.round((pct / 100) * barLen));
-      await session.sendQQ([
-        '📈 会话用量',
-        `消息: ${s.totalMessages ?? '-'}（用户 ${s.userMessages ?? '-'} / 助手 ${s.assistantMessages ?? '-'}）`,
-        `工具调用: ${s.toolCalls ?? '-'}（结果 ${s.toolResults ?? '-'}）`,
-        `Token 累计: 输入 ${fmt(t.input)} · 输出 ${fmt(t.output)} · 缓存读 ${fmt(t.cacheRead)} · 缓存写 ${fmt(t.cacheWrite)}`,
-        `总计: ${fmt(t.totalTokens)}`,
-        `上下文: ${fmt(c.tokens)} / ${fmt(c.contextWindow)}`,
-        pct == null ? '' : `占用: ${'█'.repeat(filled)}${'░'.repeat(barLen - filled)} ${pct.toFixed(1)}%`,
-        `自动压缩: ${session.autoCompaction == null ? '-' : (session.autoCompaction ? '开' : '关')}`,
-      ].filter(Boolean).join('\n'));
-    } catch (e) { await session.sendQQ(`❌ 获取用量失败: ${e.message}`); }
-    return;
-  }
-
-  if (cmd === '/compact') {
-    if (session.busy) { await session.sendQQ('⏳ 当前任务执行中，请先 /stop。'); return; }
-    try {
-      await session.sendQQ('🗜️ 正在压缩上下文，请稍候…', { plain: true });
-      const payload = { type: 'compact' };
-      if (arg) payload.customInstructions = arg;
-      session.beginWork('压缩上下文');
-      const r = await session.request(payload, 180000).finally(() => session.endWork());
-      const before = r && r.tokensBefore;
-      const after = r && r.estimatedTokensAfter;
-      const fmt = (n) => (n == null ? '-' : Number(n).toLocaleString('en-US'));
-      const saved = (before != null && after != null && before > 0)
-        ? ` (省 ${(100 - (after / before) * 100).toFixed(0)}%)` : '';
-      await session.sendQQ([
-        '🗜️ 上下文已压缩。',
-        `压缩前: ${fmt(before)} tokens`,
-        `压缩后: 约 ${fmt(after)} tokens${saved}`,
-      ].join('\n'));
-      await session.syncSessionFile();
-    } catch (e) { await session.sendQQ(`❌ 压缩失败: ${e.message}`); }
-    return;
-  }
-
-  if (cmd === '/memory') {
-    try {
-      const lines = [];
-      if (isGroup) {
-        // 群聊: 群公共记忆 + 各成员个人记忆
-        const shared = readGroupShared(groupId);
-        const mine = readMemberMemory(groupId, userId);
-        lines.push('🧠 群长期记忆', '');
-        lines.push('【群公共记忆】');
-        lines.push(shared || '（暂无）');
-        lines.push('', `文件: ${groupSharedMemPath(groupId)}`);
-        lines.push('', `【你（${userName}）的个人记忆】`);
-        lines.push(mine || '（暂无）');
-        lines.push('', `文件: ${groupMemberMemPath(groupId, userId)}`);
-        const others = listGroupMembers(groupId).filter((u) => u !== slug(userId));
-        if (others.length) {
-          lines.push('', `【其他成员】共 ${others.length} 份`);
-          for (const uid of others.slice(0, 20)) {
-            const first = readMemberMemory(groupId, uid).split('\n')[0] || '';
-            lines.push(`- QQ ${uid}: ${first.slice(0, 60)}`);
-          }
-          if (others.length > 20) lines.push(`… 其余 ${others.length - 20} 份未列出`);
-        }
-      } else {
-        const mem = readMemory(key);
-        lines.push('🧠 长期记忆', '');
-        lines.push(mem || '还没有长期记忆。直接说“记住 …”我就会记下来。');
-        lines.push('', `（文件: ${memPath(key)}；直接说“忘掉 …”或让我修改即可）`);
-      }
-      for (const part of splitForQQ(lines.join('\n'), cfg.behavior.maxChars)) {
-        await session.sendQQ(part);
-      }
-    } catch (e) { await session.sendQQ(`❌ 读取记忆失败: ${e.message}`); }
-    return;
-  }
-
-  if (cmd === '/task') {
-    mergeTaskFiles();
-    if (!TASKS.length) {
-      await session.sendQQ('⏰ 还没有定时任务。直接跟我说“每天早上 8 点提醒我喝水”即可。');
-      return;
-    }
-    const lines = TASKS.map((t, i) => {
-      const when = describeTask(t);
-      const state = t.enabled ? (t.nextRun ? `下次 ${fmtClock(t.nextRun)}` : '待调度') : '已停用';
-      const who = t.target.type === 'private' ? '私聊' : '群';
-      return `${i + 1}. ${t.name || t.id} · ${when} · ${who}${t.target.id} · ${state}`;
-    });
-    await session.sendQQ([`⏰ 定时任务（${TASKS.length}）`, ...lines].join('\n'));
-    return;
-  }
-
-  if (cmd === '/restart') {
-    // 重启整个桥接进程: 改了 bridge.js 代码或 config.json 后必须这样才生效。
-    // /reset 只重启 pi 子进程, 不会重读代码与配置。
-    //
-    // 仅限 owner (私聊白名单里的人): 否则群里任何人都能把服务重启掉。
-    if (isGroup || !PRIVATE_ALLOW.has(userId)) {
-      await session.sendQQ('⛔ /restart 仅限主人私聊使用。');
-      return;
-    }
-    await session.sendQQ('🔄 正在重启桥接，约 5 秒后回来…');
-    log(`[${key}] 用户请求重启桥接, 主动退出交由 systemd 拉起`);
-    // systemd 配了 Restart=always, 所以优雅退出即可被重新拉起。
-    // 比 spawn systemctl 可靠: 不会因为自身被 SIGTERM 而连带杀掉重启命令。
-    // 延迟 1.5 秒, 先把上面那句「正在重启」发出去。
-    setTimeout(() => { shutdown('user /restart'); }, 1500);
-    return;
-  }
-  if (cmd === '/reset') {
-    sessions.delete(key);
-    await session.destroy('user reset');
-    await session.sendQQ('♻️ 会话已重启。');
-    return;
-  }
-  if (cmd === '/queue') {
-    if (!session.busy && !session.queue.length) {
-      await session.sendQQ('📭 当前没有排队，我闲着。');
-      return;
-    }
-    const lines = [`📋 队列（${session.queue.length} 条等待中）`];
-    if (session.busy) {
-      const cur = session.turnCtx && session.turnCtx.userName;
-      lines.push(`正在处理: ${cur || '上一条消息'}`);
-    }
-    session.queue.slice(0, 10).forEach((q, i) => {
-      const who = (q.ctx && q.ctx.userName) || '匿名';
-      const brief = String(q.text || '').replace(/\s+/g, ' ').slice(0, 30);
-      lines.push(`${i + 1}. ${who}: ${brief}`);
-    });
-    if (session.queue.length > 10) lines.push(`… 还有 ${session.queue.length - 10} 条`);
-    await session.sendQQ(lines.join('\n'));
-    return;
-  }
-
-  if (cmd === '/steer') {
-    if (!arg) { await session.sendQQ('⚠️ 用法: /steer 补充一句要求'); return; }
-    if (!session.busy) {
-      // 空闲时 steer 无处可插, 直接当成普通消息处理更符合直觉
-      await session.sendQQ('💡 当前没有任务在跑，这条会当作普通消息发出。');
-      session.prompt(arg, [], ctx);
-      return;
-    }
-    if (session.steer(arg, [], ctx)) {
-      await session.sendQQ('🎯 已插话，会在当前这轮工具调用后生效。');
-    } else {
-      await session.sendQQ('❌ 插话失败：pi 未就绪。');
-    }
-    return;
-  }
-
-  if (cmd === '/stop' || cmd === '/abort') {
-    session.abortRequested = true;
-    session.send({ type: 'abort', id: `abort-${Date.now()}` });
-    session.queue = [];
-    await session.sendQQ('🛑 已请求中断。');
-    return;
-  }
-  if (cmd === '/status') {
-    const lines = [`📊 会话 ${key}`, `忙碌: ${session.busy ? '是' : '否'}`, `排队: ${session.queue.length}`];
-    try {
-      const st = await session.request({ type: 'get_state' });
-      lines.push(`模型: ${st.model ? `${st.model.provider}/${st.model.id}` : '未选择'}`);
-      lines.push(`思考: ${st.thinkingLevel || '-'}`);
-      lines.push(`消息数: ${st.messageCount ?? '-'}`);
-      lines.push(`压缩中: ${st.isCompacting ? '是' : '否'}`);
-      lines.push(`会话文件: ${st.sessionFile ? path.basename(st.sessionFile) : '-'}`);
-    } catch (e) { lines.push(`状态获取失败: ${e.message}`); }
-    if (session.stderrTail.length) {
-      const tail = session.stderrTail.join('').trim().split('\n').slice(-3).join('\n');
-      if (tail) lines.push(`stderr:\n\`\`\`\n${tail}\n\`\`\``);
-    }
-    await session.sendQQ(lines.join('\n'));
-    return;
-  }
 
   // ---- 图片下载并转 base64
   const images = [];
@@ -2850,6 +2611,318 @@ async function handleIncoming(rec) {
     [groupCtx, quoted, cardCtx, mentionCtx, promptText || '（请看图片）'].filter(Boolean).join('\n\n'),
     images, ctx,
   );
+}
+
+// ---------------------------------------------------------------- 内置命令
+
+/**
+ * 处理内置命令。返回 true 表示这条消息已被命令消费, 调用方不应再走对话流程。
+ *
+ * 单独拆出来是因为这段占了 handleIncoming 的大半 —— 命令分发和对话主流程
+ * 混在一起时, 改任何一条命令都要在 400 多行里翻找。
+ */
+async function dispatchCommand(session, cmd, arg, ctx) {
+  const { isGroup, userId, groupId, userName, key } = ctx;
+
+  if (cmd === '/help' || cmd === '帮助') { await session.sendQQ(HELP); return true; }
+
+  if (cmd === '/new') {
+    if (session.busy) { await session.sendQQ('⏳ 当前任务执行中，请先 /stop。'); return true; }
+    try {
+      session.beginWork('开启新会话');
+      const file = await session.newSession();
+      const d = await session.describeModel();
+      await session.sendQQ([
+        '🆕 已开启新会话。',
+        `模型: ${d.model ? `${d.model.provider}/${d.model.id}` : '未选择'}`,
+        `思考: ${d.thinkingLevel || '-'}`,
+        file ? `文件: ${path.basename(file)}` : '',
+      ].filter(Boolean).join('\n'));
+    } catch (e) { await session.sendQQ(`❌ 开启新会话失败: ${e.message}`); }
+    finally { session.endWork(); }
+    return true;
+  }
+
+  if (cmd === '/resume') {
+    if (session.busy) { await session.sendQQ('⏳ 当前任务执行中，请先 /stop。'); return true; }
+    const files = session.historyFiles();
+    if (!files.length) { await session.sendQQ('📭 没有可恢复的历史会话。'); return true; }
+    const limit = Math.min(files.length, 10);
+    session.lastResumeList = files.slice(0, limit);
+    if (!arg) {
+      const lines = session.lastResumeList.map((f, i) => {
+        const s = readSessionSummary(f);
+        const cur = f === session.sessionFile ? ' ← 当前' : '';
+        return `${i + 1}. [${s.time}] ${s.title} (${s.size})${cur}`;
+      });
+      await session.sendQQ(`📚 历史会话（/resume 序号 选择）\n${lines.join('\n')}`);
+      return true;
+    }
+    const idx = pickIndex(arg, session.lastResumeList.length);
+    if (idx === null) { await session.sendQQ(`⚠️ 序号需在 1-${session.lastResumeList.length} 之间。`); return true; }
+    try {
+      session.beginWork('恢复会话');
+      const file = await session.switchTo(session.lastResumeList[idx]);
+      const d = await session.describeModel();
+      await session.sendQQ([
+        '📂 已恢复会话。',
+        `标题: ${readSessionSummary(file).title}`,
+        `模型: ${d.model ? `${d.model.provider}/${d.model.id}` : '未选择'}`,
+        `思考: ${d.thinkingLevel || '-'}`,
+      ].join('\n'));
+    } catch (e) { await session.sendQQ(`❌ 恢复会话失败: ${e.message}`); }
+    finally { session.endWork(); }
+    return true;
+  }
+
+  if (cmd === '/model') {
+    if (session.busy) { await session.sendQQ('⏳ 当前任务执行中，请先 /stop。'); return true; }
+    try {
+      const d = await session.describeModel();
+      if (!arg) {
+        const r = await session.request({ type: 'get_available_models' });
+        const models = (r && r.models) || [];
+        session.lastModelList = models;
+        if (!models.length) { await session.sendQQ('📭 没有可用模型。'); return true; }
+        const cur = d.model ? `${d.model.provider}/${d.model.id}` : '';
+        const lines = models.map((m, i) => {
+          const tag = `${m.provider}/${m.id}` === cur ? ' ← 当前' : '';
+          return `${i + 1}. ${m.provider}/${m.id}${tag}`;
+        });
+        await session.sendQQ(`🧠 可用模型（/model 序号 选择）\n${lines.join('\n')}`);
+        return true;
+      }
+      let target = null;
+      // 允许直接 /model 3 而无需先列表
+      if (!session.lastModelList && /^\d+$/.test(arg)) {
+        const r = await session.request({ type: 'get_available_models' });
+        session.lastModelList = (r && r.models) || [];
+      }
+      const idx = pickIndex(arg, (session.lastModelList || []).length);
+      if (idx !== null) target = session.lastModelList[idx];
+      else if (arg.includes('/')) {
+        const i = arg.indexOf('/');
+        target = { provider: arg.slice(0, i), id: arg.slice(i + 1) };
+      }
+      if (!target) { await session.sendQQ('⚠️ 用法: /model 或 /model 序号 或 /model provider/model'); return true; }
+      const after = await session.setModel(target.provider, target.id);
+      await session.sendQQ([
+        `🧠 已切换模型: ${after.model ? `${after.model.provider}/${after.model.id}` : `${target.provider}/${target.id}`}`,
+        `思考: ${after.thinkingLevel || '-'}${after.levels.length ? `（可选 ${after.levels.join('/')}）` : ''}`,
+      ].join('\n'));
+    } catch (e) { await session.sendQQ(`❌ 切换模型失败: ${e.message}`); }
+  return true;
+  }
+
+  if (THINK_ALIAS.has(cmd)) {
+    if (session.busy) { await session.sendQQ('⏳ 当前任务执行中，请先 /stop。'); return true; }
+    try {
+      const d = await session.describeModel();
+      if (!arg) {
+        await session.sendQQ([
+          `🧩 当前思考等级: ${d.thinkingLevel || '-'}`,
+          d.levels.length ? `可选: ${d.levels.join(' / ')}` : '当前模型不支持思考等级设置。',
+          d.levels.length ? '用法: /thinking <等级>' : '',
+        ].filter(Boolean).join('\n'));
+        return true;
+      }
+      const level = arg.toLowerCase();
+      if (d.levels.length && !d.levels.includes(level)) {
+        await session.sendQQ(`⚠️ 该模型仅支持: ${d.levels.join(' / ')}`);
+        return true;
+      }
+      const real = await session.setThinking(level);
+      if (real !== level) {
+        await session.sendQQ(`⚠️ 设置未生效，当前仍为 ${real || '-'}${d.levels.length ? `（可选 ${d.levels.join('/')}）` : ''}`);
+        return true;
+      }
+      await session.sendQQ(`🧩 思考等级已设为 ${real}`);
+    } catch (e) { await session.sendQQ(`❌ 设置思考等级失败: ${e.message}`); }
+  return true;
+  }
+
+  if (cmd === '/stats') {
+    try {
+      const s = await session.request({ type: 'get_session_stats' });
+      const t = s.tokens || {};
+      const c = s.contextUsage || {};
+      const fmt = (n) => (n == null ? '-' : Number(n).toLocaleString('en-US'));
+      const pct = c.percent == null ? null : c.percent;
+      const barLen = 12;
+      const filled = pct == null ? 0 : Math.min(barLen, Math.round((pct / 100) * barLen));
+      await session.sendQQ([
+        '📈 会话用量',
+        `消息: ${s.totalMessages ?? '-'}（用户 ${s.userMessages ?? '-'} / 助手 ${s.assistantMessages ?? '-'}）`,
+        `工具调用: ${s.toolCalls ?? '-'}（结果 ${s.toolResults ?? '-'}）`,
+        `Token 累计: 输入 ${fmt(t.input)} · 输出 ${fmt(t.output)} · 缓存读 ${fmt(t.cacheRead)} · 缓存写 ${fmt(t.cacheWrite)}`,
+        `总计: ${fmt(t.totalTokens)}`,
+        `上下文: ${fmt(c.tokens)} / ${fmt(c.contextWindow)}`,
+        pct == null ? '' : `占用: ${'█'.repeat(filled)}${'░'.repeat(barLen - filled)} ${pct.toFixed(1)}%`,
+        `自动压缩: ${session.autoCompaction == null ? '-' : (session.autoCompaction ? '开' : '关')}`,
+      ].filter(Boolean).join('\n'));
+    } catch (e) { await session.sendQQ(`❌ 获取用量失败: ${e.message}`); }
+  return true;
+  }
+
+  if (cmd === '/compact') {
+    if (session.busy) { await session.sendQQ('⏳ 当前任务执行中，请先 /stop。'); return true; }
+    try {
+      await session.sendQQ('🗜️ 正在压缩上下文，请稍候…', { plain: true });
+      const payload = { type: 'compact' };
+      if (arg) payload.customInstructions = arg;
+      session.beginWork('压缩上下文');
+      const r = await session.request(payload, 180000).finally(() => session.endWork());
+      const before = r && r.tokensBefore;
+      const after = r && r.estimatedTokensAfter;
+      const fmt = (n) => (n == null ? '-' : Number(n).toLocaleString('en-US'));
+      const saved = (before != null && after != null && before > 0)
+        ? ` (省 ${(100 - (after / before) * 100).toFixed(0)}%)` : '';
+      await session.sendQQ([
+        '🗜️ 上下文已压缩。',
+        `压缩前: ${fmt(before)} tokens`,
+        `压缩后: 约 ${fmt(after)} tokens${saved}`,
+      ].join('\n'));
+      await session.syncSessionFile();
+    } catch (e) { await session.sendQQ(`❌ 压缩失败: ${e.message}`); }
+  return true;
+  }
+
+  if (cmd === '/memory') {
+    try {
+      const lines = [];
+      if (isGroup) {
+        // 群聊: 群公共记忆 + 各成员个人记忆
+        const shared = readGroupShared(groupId);
+        const mine = readMemberMemory(groupId, userId);
+        lines.push('🧠 群长期记忆', '');
+        lines.push('【群公共记忆】');
+        lines.push(shared || '（暂无）');
+        lines.push('', `文件: ${groupSharedMemPath(groupId)}`);
+        lines.push('', `【你（${userName}）的个人记忆】`);
+        lines.push(mine || '（暂无）');
+        lines.push('', `文件: ${groupMemberMemPath(groupId, userId)}`);
+        const others = listGroupMembers(groupId).filter((u) => u !== slug(userId));
+        if (others.length) {
+          lines.push('', `【其他成员】共 ${others.length} 份`);
+          for (const uid of others.slice(0, 20)) {
+            const first = readMemberMemory(groupId, uid).split('\n')[0] || '';
+            lines.push(`- QQ ${uid}: ${first.slice(0, 60)}`);
+          }
+          if (others.length > 20) lines.push(`… 其余 ${others.length - 20} 份未列出`);
+        }
+      } else {
+        const mem = readMemory(key);
+        lines.push('🧠 长期记忆', '');
+        lines.push(mem || '还没有长期记忆。直接说“记住 …”我就会记下来。');
+        lines.push('', `（文件: ${memPath(key)}；直接说“忘掉 …”或让我修改即可）`);
+      }
+      for (const part of splitForQQ(lines.join('\n'), cfg.behavior.maxChars)) {
+        await session.sendQQ(part);
+      }
+    } catch (e) { await session.sendQQ(`❌ 读取记忆失败: ${e.message}`); }
+  return true;
+  }
+
+  if (cmd === '/task') {
+    mergeTaskFiles();
+    if (!TASKS.length) {
+      await session.sendQQ('⏰ 还没有定时任务。直接跟我说“每天早上 8 点提醒我喝水”即可。');
+      return true;
+    }
+    const lines = TASKS.map((t, i) => {
+      const when = describeTask(t);
+      const state = t.enabled ? (t.nextRun ? `下次 ${fmtClock(t.nextRun)}` : '待调度') : '已停用';
+      const who = t.target.type === 'private' ? '私聊' : '群';
+      return `${i + 1}. ${t.name || t.id} · ${when} · ${who}${t.target.id} · ${state}`;
+    });
+    await session.sendQQ([`⏰ 定时任务（${TASKS.length}）`, ...lines].join('\n'));
+  return true;
+  }
+
+  if (cmd === '/restart') {
+    // 重启整个桥接进程: 改了 bridge.js 代码或 config.json 后必须这样才生效。
+    // /reset 只重启 pi 子进程, 不会重读代码与配置。
+    //
+    // 仅限 owner (私聊白名单里的人): 否则群里任何人都能把服务重启掉。
+    if (isGroup || !PRIVATE_ALLOW.has(userId)) {
+      await session.sendQQ('⛔ /restart 仅限主人私聊使用。');
+      return true;
+    }
+    await session.sendQQ('🔄 正在重启桥接，约 5 秒后回来…');
+    log(`[${key}] 用户请求重启桥接, 主动退出交由 systemd 拉起`);
+    // systemd 配了 Restart=always, 所以优雅退出即可被重新拉起。
+    // 比 spawn systemctl 可靠: 不会因为自身被 SIGTERM 而连带杀掉重启命令。
+    // 延迟 1.5 秒, 先把上面那句「正在重启」发出去。
+    setTimeout(() => { shutdown('user /restart'); }, 1500);
+  return true;
+  }
+  if (cmd === '/reset') {
+    sessions.delete(key);
+    await session.destroy('user reset');
+    await session.sendQQ('♻️ 会话已重启。');
+  return true;
+  }
+  if (cmd === '/queue') {
+    if (!session.busy && !session.queue.length) {
+      await session.sendQQ('📭 当前没有排队，我闲着。');
+      return true;
+    }
+    const lines = [`📋 队列（${session.queue.length} 条等待中）`];
+    if (session.busy) {
+      const cur = session.turnCtx && session.turnCtx.userName;
+      lines.push(`正在处理: ${cur || '上一条消息'}`);
+    }
+    session.queue.slice(0, 10).forEach((q, i) => {
+      const who = (q.ctx && q.ctx.userName) || '匿名';
+      const brief = String(q.text || '').replace(/\s+/g, ' ').slice(0, 30);
+      lines.push(`${i + 1}. ${who}: ${brief}`);
+    });
+    if (session.queue.length > 10) lines.push(`… 还有 ${session.queue.length - 10} 条`);
+    await session.sendQQ(lines.join('\n'));
+  return true;
+  }
+
+  if (cmd === '/steer') {
+    if (!arg) { await session.sendQQ('⚠️ 用法: /steer 补充一句要求'); return true; }
+    if (!session.busy) {
+      // 空闲时 steer 无处可插, 直接当成普通消息处理更符合直觉
+      await session.sendQQ('💡 当前没有任务在跑，这条会当作普通消息发出。');
+      session.prompt(arg, [], ctx);
+      return true;
+    }
+    if (session.steer(arg, [], ctx)) {
+      await session.sendQQ('🎯 已插话，会在当前这轮工具调用后生效。');
+    } else {
+      await session.sendQQ('❌ 插话失败：pi 未就绪。');
+    }
+  return true;
+  }
+
+  if (cmd === '/stop' || cmd === '/abort') {
+    session.abortRequested = true;
+    session.send({ type: 'abort', id: `abort-${Date.now()}` });
+    session.queue = [];
+    await session.sendQQ('🛑 已请求中断。');
+  return true;
+  }
+  if (cmd === '/status') {
+    const lines = [`📊 会话 ${key}`, `忙碌: ${session.busy ? '是' : '否'}`, `排队: ${session.queue.length}`];
+    try {
+      const st = await session.request({ type: 'get_state' });
+      lines.push(`模型: ${st.model ? `${st.model.provider}/${st.model.id}` : '未选择'}`);
+      lines.push(`思考: ${st.thinkingLevel || '-'}`);
+      lines.push(`消息数: ${st.messageCount ?? '-'}`);
+      lines.push(`压缩中: ${st.isCompacting ? '是' : '否'}`);
+      lines.push(`会话文件: ${st.sessionFile ? path.basename(st.sessionFile) : '-'}`);
+    } catch (e) { lines.push(`状态获取失败: ${e.message}`); }
+    if (session.stderrTail.length) {
+      const tail = session.stderrTail.join('').trim().split('\n').slice(-3).join('\n');
+      if (tail) lines.push(`stderr:\n\`\`\`\n${tail}\n\`\`\``);
+    }
+    await session.sendQQ(lines.join('\n'));
+  return true;
+  }
+  return false;
 }
 
 function guessMime(buf) {
@@ -3080,10 +3153,68 @@ async function sweepOutbox() {
   }
 }
 
+// ---------------------------------------------------------------- 磁盘回收
+
+/**
+ * 清理会话文件与 inbox 缓存。
+ *
+ * 这两处此前只进不出: 会话 .jsonl 只增不减(已积累到 12MB / 单文件 4MB),
+ * 用户发来的文件下载后也永久堆积。机器磁盘不大, 长期跑总会满。
+ *
+ * 保留规则(宁可少删不可误删):
+ *  - state.json 里引用过的会话文件永不删 (那是用户 /resume 的入口)
+ *  - 未被引用且超过保留天数的才删
+ *  - inbox 只按天数删
+ */
+async function sweepStorage() {
+  const now = Date.now();
+  const dayMs = 24 * 60 * 60 * 1000;
+  const keepDays = Math.max(1, Number(cfg.behavior.sessionRetentionDays) || 30);
+  const inboxDays = Math.max(1, Number(cfg.behavior.inboxRetentionDays) || 7);
+  let removed = 0;
+  let freed = 0;
+
+  // 1) 会话文件
+  const referenced = new Set();
+  for (const k of Object.keys(STATE)) {
+    const s = STATE[k];
+    if (!s || typeof s !== 'object') continue;
+    if (s.sessionFile) referenced.add(path.basename(String(s.sessionFile)));
+    for (const f of (Array.isArray(s.history) ? s.history : [])) referenced.add(path.basename(String(f)));
+  }
+  try {
+    for (const f of fs.readdirSync(cfg.pi.sessionDir)) {
+      if (!f.endsWith('.jsonl')) continue;
+      if (referenced.has(f)) continue;
+      const full = path.join(cfg.pi.sessionDir, f);
+      let st;
+      try { st = fs.statSync(full); } catch { continue; }
+      if (now - st.mtimeMs < keepDays * dayMs) continue;
+      try { fs.unlinkSync(full); removed++; freed += st.size; } catch { /* 删不掉下轮再说 */ }
+    }
+  } catch { /* 目录不存在 */ }
+
+  // 2) inbox 缓存
+  try {
+    for (const f of fs.readdirSync(INBOX_DIR)) {
+      const full = path.join(INBOX_DIR, f);
+      let st;
+      try { st = fs.statSync(full); } catch { continue; }
+      if (!st.isFile()) continue;
+      if (now - st.mtimeMs < inboxDays * dayMs) continue;
+      try { fs.unlinkSync(full); removed++; freed += st.size; } catch { /* 同上 */ }
+    }
+  } catch { /* 目录不存在 */ }
+
+  if (removed) log(`磁盘回收: 删除 ${removed} 个过期文件, 释放 ${humanSize(freed)}`);
+  return removed;
+}
+
 // ---------------------------------------------------------------- 启动
 
 let outboxTimer = null;
 let taskTimer = null;
+let storageTimer = null;
 let heartbeatTimer = null;
 let turnTimer = null;
 let silenceTimer = null;
@@ -3096,10 +3227,10 @@ function fatal(kind, e) {
   // stdout/stderr 的管道被读端关掉(典型: `node x.js | head -3` 里 head 退出)时
   // 写日志会永远抛 EPIPE。此时再写一行就是死循环, 只能直接退出。
   if (err.code === 'EPIPE') {
-    try { process.stderr.write(`[fatal] ${kind}: EPIPE (日志管道已关闭), 退出\n`); } catch {}
+    try { process.stderr.write(`${new Date().toISOString()} [error] fatal ${kind}: EPIPE (日志管道已关闭), 退出\n`); } catch {}
     process.exit(1);
   }
-  try { process.stderr.write(`${new Date().toISOString()} [fatal] ${kind}: ${err.stack || err.message}\n`); } catch {}
+  try { process.stderr.write(`${new Date().toISOString()} [error] fatal ${kind}: ${err.stack || err.message}\n`); } catch {}
   // 交给 systemd (Restart=always) 拉起一个干净进程, 而不是留在这里半死不活
   process.exit(1);
 }
@@ -3125,6 +3256,14 @@ function start() {
   taskTimer.unref();
   log(`定时任务: ${TASKS.length} 个已加载 (目录 ${TASKS_DIR}, 每 ${TASK_TICK_MS}ms 巡检)`);
   log(`长期记忆目录: ${MEM_DIR}`);
+
+  // 磁盘回收: 启动时跑一次, 之后每 6 小时一次
+  const STORAGE_MS = Math.max(60000, Number(cfg.behavior.storageSweepMs) || 6 * 60 * 60 * 1000);
+  sweepStorage().catch((e) => warn(`磁盘回收失败: ${e.message}`));
+  storageTimer = setInterval(() => {
+    sweepStorage().catch((e) => warn(`磁盘回收失败: ${e.message}`));
+  }, STORAGE_MS);
+  storageTimer.unref();
 
   // 自愈: 看门狗只覆盖「连着 WS 但对方不吭声」, 这里补上「WS 已死 / 卡在重连」的兜底。
   // 一个自持 ws 客户端掉线后会自己重连, 若进程整体被日志管道等外部原因卡住,
@@ -3225,6 +3364,7 @@ async function shutdown(reason) {
   notify('STOPPING=1');
   log(`正在关闭...${typeof reason === 'string' && reason ? ` (${reason})` : ''}`);
   if (outboxTimer) clearInterval(outboxTimer);
+  if (storageTimer) clearInterval(storageTimer);
   if (taskTimer) clearInterval(taskTimer);
   if (heartbeatTimer) clearInterval(heartbeatTimer);
   if (turnTimer) clearInterval(turnTimer);

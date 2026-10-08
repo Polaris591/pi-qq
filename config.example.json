@@ -57,7 +57,12 @@
     "selfHealMs": 120000,
     "taskTickMs": 20000,
     "missedWindowMs": 1800000,
-    "markdownToPlain": true
+    "markdownToPlain": true,
+    "sessionRetentionDays": 30,
+    "inboxRetentionDays": 7,
+    "storageSweepMs": 21600000,
+    "spawnQuickExitMs": 10000,
+    "spawnMaxBackoffMs": 300000
   },
   "persona": {
     "text": "",
