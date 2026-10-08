@@ -30,7 +30,7 @@ fs.writeFileSync(path.join(BASE, 'config.json'), JSON.stringify({
 
 const src = fs.readFileSync(path.join(__dirname, 'bridge.js'), 'utf8');
 fs.writeFileSync(path.join(BASE, 'bridge.js'), `${src}
-module.exports = { PiSession, sessions, alertTarget, cfg, onebot, fetchGroupContext, GROUP_CTX_CACHE, sweepStorage, STATE, dispatchCommand, HELP, requestRestart, maybeRestartNow, busySessionCount, setExitHook, restartState };
+module.exports = { PiSession, sessions, alertTarget, cfg, onebot, fetchGroupContext, GROUP_CTX_CACHE, sweepStorage, STATE, dispatchCommand, HELP, requestRestart, maybeRestartNow, busySessionCount, setExitHook, restartState, mdToPlain };
 `);
 
 const results = [];
@@ -684,6 +684,19 @@ const ok = (name, pass, extra) => { results.push({ name, pass }); console.log(`$
     B.sessions.delete('private_95');
     s.closed = true;
     B.setExitHook(null);
+  }
+
+  // ---- 修复 22: 落单的代码围栏不能原样发到 QQ
+  {
+    const a = B.mdToPlain('看这个:\n```js\nconst a = 1;');
+    ok('未闭合围栏不残留反引号', !a.includes('```'), JSON.stringify(a));
+    ok('未闭合围栏内容仍保留', a.includes('const a = 1;'), JSON.stringify(a));
+
+    const b = B.mdToPlain('```js\nconst a = 1;\n```');
+    ok('闭合围栏不残留反引号', !b.includes('```'), JSON.stringify(b));
+
+    const c = B.mdToPlain('用 `npm test` 跑');
+    ok('行内代码去反引号', c === '用 npm test 跑', JSON.stringify(c));
   }
 
   console.log('\n===== 结果 =====');

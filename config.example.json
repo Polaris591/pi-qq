@@ -65,7 +65,7 @@
     "spawnMaxBackoffMs": 300000,
     "outboxSentRetentionDays": 30,
     "thinkingGuardChars": 80000,
-    "restartMaxWaitMs": 300000
+    "restartMaxWaitMs": 1800000
   },
   "persona": {
     "text": "",

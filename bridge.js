@@ -535,6 +535,11 @@ function mdToPlain(text) {
     // 分隔线 --- *** ___ -> 一条细线
     if (/^\s*([-*_])\1{2,}\s*$/.test(line)) { out.push('——————'); inTable = false; continue; }
 
+    // 落单的围栏: 成对的代码块在上面已经抽走了, 能走到这里的 ``` 一定没有配对
+    // (流式被截断、模型忘了收尾、或撞上输出上限)。原样发出去 QQ 里就是一行
+    // 反引号, 所以在这里收掉, 用分隔线示意代码区。
+    if (/^\s*```/.test(line)) { out.push('———'); inTable = false; continue; }
+
     // 表格: 跳过 |---| 分隔行, 其余把 | 换成制表感的分隔
     if (/^\s*\|?\s*:?-{2,}:?\s*(\|\s*:?-{2,}:?\s*)*\|?\s*$/.test(line) && line.includes('-')) {
       inTable = true;
@@ -3370,8 +3375,9 @@ let exitHook = null;
 function setExitHook(fn) { exitHook = fn || null; }
 
 function busySessionCount() {
+  // retryPending 也算忙: 那个会话 500ms 后还要重发一次, 现在重启会把重试吞掉
   let n = 0;
-  for (const [, s] of sessions) if (s.busy) n++;
+  for (const [, s] of sessions) if (s.busy || s.retryPending) n++;
   return n;
 }
 
@@ -3389,11 +3395,18 @@ function requestRestart(reason) {
 /** 空闲就重启, 忙就继续等 (超过 restartMaxWaitMs 强制重启, 避免永远等下去) */
 function maybeRestartNow() {
   if (shuttingDown || !pendingRestart || restartScheduled) return;
-  const maxWait = Math.max(30000, Number(cfg.behavior.restartMaxWaitMs) || 300000);
+  const maxWait = Math.max(60000, Number(cfg.behavior.restartMaxWaitMs) || 30 * 60 * 1000);
   const waited = () => Date.now() - (pendingRestart ? pendingRestart.at : Date.now());
   const busy = busySessionCount();
   if (busy && waited() < maxWait) return;
-  if (busy) warn(`重启已等待 ${Math.round(waited() / 1000)}s, 仍有 ${busy} 个会话在跑, 强制重启`);
+  if (busy) {
+    // 默认 30 分钟: 设短了就会把正在跑的长任务强杀掉, 正是这次要修掉的行为。
+    // 真等到超时说明确实有会话卡了很久, 那就重启, 但要告诉用户一声。
+    warn(`重启已等待 ${Math.round(waited() / 1000)}s, 仍有 ${busy} 个会话在跑, 强制重启`);
+    sendAlert(`⚠️ 重启请求已等待 ${Math.round(waited() / 1000 / 60)} 分钟，`
+      + `但还有 ${busy} 个会话在跑，已强制重启。那几条消息可能没答完，需要的话重发。`)
+      .catch(() => {});
+  }
   const reason = pendingRestart.reason;
   restartScheduled = true;
   // 留 2 秒让最后几段 flush 发完 (flush 内部每段之间还有 sleep)
