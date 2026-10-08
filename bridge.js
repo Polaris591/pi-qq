@@ -97,9 +97,11 @@ const cfg = {
     turnTimeoutMs: 45 * 60 * 1000,
     // 静默提醒: pi 处于 busy 且该毫秒数内没有任何输出 => 发一条「还在跑」, 0 关闭
     // 模型长思考或长命令执行时, 桥接没有任何 text_delta 可发, 用户会以为死了。
-    silenceNoticeMs: 60 * 1000,
+    // 静默提醒默认值放宽: pi 在长命令执行期间会周期性发 tool_execution_update 心跳,
+    // 那只是「进程还在」, 对用户而言仍然是一片安静。45 秒足够盖住常见的中等工具。
+    silenceNoticeMs: 45 * 1000,
     // 单轮内最多提醒几次, 避免长任务刷屏
-    silenceNoticeMax: 5,
+    silenceNoticeMax: 8,
     // 自愈巡检间隔: WS 已死且长时间无上报时主动退出, 交由 systemd 拉起
     selfHealMs: 120000,
     ...(config.behavior || {}),
