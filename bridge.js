@@ -102,6 +102,9 @@ const cfg = {
     silenceNoticeMs: 45 * 1000,
     // 单轮内最多提醒几次, 避免长任务刷屏
     silenceNoticeMax: 8,
+    // 静音模式: 除了正文和「这条消息没被处理」这类必要提示之外, 桥接不主动插话。
+    // 关掉的是: 排队提示、定时任务的「执行中…」。静默提醒另有 silenceNoticeMs=0。
+    quietNotices: false,
     // 自愈巡检间隔: WS 已死且长时间无上报时主动退出, 交由 systemd 拉起
     selfHealMs: 120000,
     ...(config.behavior || {}),
@@ -1155,8 +1158,11 @@ class PiSession {
         return;
       }
       this.queue.push({ text, images, ctx });
-      const pos = this.queue.length;
-      warnOnce('queued', `⏳ 前面还有 ${pos} 条在处理，你这条已排队。`);
+      // 静音模式下不提示排队: 用户只想要正文, 排队提示属于噪音。
+      // 但「排队已满」那条保留 —— 那是消息真的被丢了, 必须让人知道。
+      if (!cfg.behavior.quietNotices) {
+        warnOnce('queued', `⏳ 前面还有 ${this.queue.length} 条在处理，你这条已排队。`);
+      }
       return;
     }
     this.busy = true;
@@ -2139,7 +2145,9 @@ async function runTask(t) {
   const key = sessionKey(target);
   const label = t.name || t.id;
   log(`执行定时任务: ${t.id} -> ${key}`);
-  notifyTarget(target, `⏰ 定时任务「${label}」执行中…`).catch(() => {});
+  if (!cfg.behavior.quietNotices) {
+    notifyTarget(target, `⏰ 定时任务「${label}」执行中…`).catch(() => {});
+  }
 
   // 任务跑在独立会话里, 不污染用户当前对话的上下文
   const ps = new PiSession(key, target, { ephemeral: true });

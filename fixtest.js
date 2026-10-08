@@ -717,6 +717,45 @@ const ok = (name, pass, extra) => { results.push({ name, pass }); console.log(`$
     B.onebot.onRecord = orig;
   }
 
+  // ---- 修复 24: 静音模式不主动插话
+  {
+    const sent = [];
+    const mk = () => {
+      const s = new B.PiSession('private_96', { type: 'private', id: '96' });
+      s.sendQQ = async (t) => { sent.push(String(t)); return { status: 'ok' }; };
+      s.send = () => true;
+      s.proc = { stdin: { writable: true, write: (d, cb) => { if (cb) cb(null); }, on: () => {} } };
+      return s;
+    };
+
+    // 静音开: 排队不提示
+    B.cfg.behavior.quietNotices = true;
+    const a = mk();
+    a.prompt('第一条', [], { replyTo: null, atUser: null });
+    a.prompt('第二条', [], { replyTo: null, atUser: null });
+    ok('静音模式不提示排队', !sent.some((t) => t.includes('已排队')), JSON.stringify(sent));
+    ok('静音模式下消息照样入队', a.queue.length === 1, `q=${a.queue.length}`);
+
+    // 静音关: 照常提示
+    sent.length = 0;
+    B.cfg.behavior.quietNotices = false;
+    const b = mk();
+    b.prompt('第一条', [], { replyTo: null, atUser: null });
+    b.prompt('第二条', [], { replyTo: null, atUser: null });
+    ok('非静音模式仍提示排队', sent.some((t) => t.includes('已排队')), JSON.stringify(sent));
+
+    // 排队满 = 消息真的被丢了, 无论静音与否都要说
+    sent.length = 0;
+    B.cfg.behavior.quietNotices = true;
+    const c = mk();
+    c.prompt('第一条', [], { replyTo: null, atUser: null });
+    for (let i = 0; i < 10; i++) c.prompt(`x${i}`, [], { replyTo: null, atUser: null });
+    ok('排队满仍提示(消息被丢不能瞒)', sent.some((t) => t.includes('排队已满')), JSON.stringify(sent));
+
+    B.cfg.behavior.quietNotices = false;
+    a.closed = true; b.closed = true; c.closed = true;
+  }
+
   console.log('\n===== 结果 =====');
   const bad = results.filter((r) => !r.pass);
   console.log(`通过 ${results.length - bad.length}/${results.length}`);
