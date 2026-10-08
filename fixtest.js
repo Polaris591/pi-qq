@@ -568,6 +568,85 @@ const ok = (name, pass, extra) => { results.push({ name, pass }); console.log(`$
     s.closed = true; s2.closed = true;
   }
 
+  // ---- 修复 19: 空回复重试不能把队列里别人的消息当成本轮重试对象
+  {
+    const s = new B.PiSession('private_90', { type: 'private', id: '90' });
+    const prompts = [];
+    s.sendQQ = async () => ({ status: 'ok' });
+    s.send = () => true;
+    s.proc = { stdin: { writable: true, write: (d, cb) => { if (cb) cb(null); }, on: () => {} } };
+    const orig = s.prompt.bind(s);
+    s.prompt = (t, i, c) => { prompts.push(t); return orig(t, i, c); };
+
+    s.prompt('第一条', [], { replyTo: null, atUser: null });
+    s.prompt('第二条', [], { replyTo: null, atUser: null });   // busy, 入队
+    ok('第二条已排队', s.queue.length === 1, `q=${s.queue.length}`);
+
+    s.buf = '';
+    s.onRecord({ type: 'agent_settled' });     // 第一条空回复
+    ok('重试期间不 drain 队列', s.queue.length === 1 && s.retryPending === true,
+      `q=${s.queue.length} pending=${s.retryPending}`);
+
+    await new Promise((r) => setTimeout(r, 700));
+    ok('重试的是本轮消息', prompts.filter((x) => x === '第一条').length === 2,
+      JSON.stringify(prompts));
+    // 「第二条」只应出现一次(最初那次调用), 不该被重试逻辑再发一遍
+    ok('没把别人的消息当重试对象', prompts.filter((x) => x === '第二条').length === 1,
+      JSON.stringify(prompts));
+    ok('最后一次发出的是本轮消息', prompts[prompts.length - 1] === '第一条',
+      JSON.stringify(prompts));
+    ok('重试后别人那条仍在队列', s.queue.length === 1 && s.queue[0].text === '第二条',
+      JSON.stringify(s.queue.map((q) => q.text)));
+    s.closed = true;
+  }
+
+  // ---- 修复 20: /stop 必须能取消已排上的空回复重试
+  {
+    const mk = (key) => {
+      const s = new B.PiSession(key, { type: 'private', id: key.split('_')[1] });
+      s.sendQQ = async () => ({ status: 'ok' });
+      s.send = () => true;
+      s.proc = { stdin: { writable: true, write: (d, cb) => { if (cb) cb(null); }, on: () => {} } };
+      const prompts = [];
+      const orig = s.prompt.bind(s);
+      s.prompt = (t, i, c) => { prompts.push(t); return orig(t, i, c); };
+      return { s, prompts };
+    };
+
+    // A: /stop 清掉定时器
+    const a = mk('private_91');
+    a.s.prompt('要停掉的', [], { replyTo: null, atUser: null });
+    a.s.buf = '';
+    a.s.onRecord({ type: 'agent_settled' });
+    ok('已排上重试', a.s.retryPending === true && a.s.retryTimer !== null);
+    a.s.abortRequested = true;
+    clearTimeout(a.s.retryTimer); a.s.retryTimer = null; a.s.retryPending = false;
+    await new Promise((r) => setTimeout(r, 700));
+    ok('/stop 后不再重发', a.prompts.filter((x) => x === '要停掉的').length === 1,
+      JSON.stringify(a.prompts));
+
+    // B: 就算定时器没清, abortRequested 兜底也要拦住
+    const b = mk('private_92');
+    b.s.prompt('也要停掉', [], { replyTo: null, atUser: null });
+    b.s.buf = '';
+    b.s.onRecord({ type: 'agent_settled' });
+    b.s.abortRequested = true;          // 只设标志, 不清定时器
+    await new Promise((r) => setTimeout(r, 700));
+    ok('abortRequested 兜底拦住重试', b.prompts.filter((x) => x === '也要停掉').length === 1,
+      JSON.stringify(b.prompts));
+
+    // C: destroy 也要清掉
+    const c = mk('private_93');
+    c.s.prompt('销毁前', [], { replyTo: null, atUser: null });
+    c.s.buf = '';
+    c.s.onRecord({ type: 'agent_settled' });
+    await c.s.destroy('test');
+    ok('destroy 清掉重试定时器', c.s.retryTimer === null && c.s.retryPending === false);
+    await new Promise((r) => setTimeout(r, 700));
+    ok('销毁后不重发', c.prompts.filter((x) => x === '销毁前').length === 1,
+      JSON.stringify(c.prompts));
+  }
+
   console.log('\n===== 结果 =====');
   const bad = results.filter((r) => !r.pass);
   console.log(`通过 ${results.length - bad.length}/${results.length}`);

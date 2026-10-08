@@ -634,6 +634,8 @@ class PiSession {
     this.turnHadOutput = false;      // 本轮是否真的给用户发过东西 (空回复检测)
     this.thinkChars = 0;             // 本轮思考累计字符数
     this.thinkGuardFired = false;    // 本轮是否已因思考过长中断过
+    this.retryPending = false;       // 是否已排上「空回复自动重试」(期间不 drain 队列)
+    this.retryTimer = null;          // 重试定时器句柄 (/stop 与销毁时要能取消)
     this.emptyRetries = 0;           // 连续空回复次数 (最多自动重试 1 次)
     this.lastPrompt = null;          // 空回复时原样重试用
     this.spawnedAt = 0;              // 本次 pi 子进程的启动时刻 (退避判断用)
@@ -955,9 +957,16 @@ class PiSession {
             // 重试成功时用户不需要知道这件事, 群里更不该出现这种技术黑话。
             // 只在重试也失败时才出声。
             log(`[${this.key}] 空回复, 自动重试一次`);
-            setTimeout(() => {
-              if (this.closed) return;
-              const lp = this.lastPrompt;
+            // 必须立刻快照: 500ms 内 this.lastPrompt 可能已被队列里的下一条
+            // 消息覆盖(agent_settled 末尾就会 drainQueue), 那样重试读到的就是
+            // 别人的消息, 会把那条消息重复处理一遍。
+            const lp = this.lastPrompt;
+            this.retryPending = true;
+            this.retryTimer = setTimeout(() => {
+              this.retryTimer = null;
+              this.retryPending = false;
+              // 这 500ms 里用户可能按了 /stop: 那就别再把他刚叫停的消息发一遍
+              if (this.closed || this.abortRequested) return;
               this.prompt(lp.text, lp.images, lp.ctx);
             }, 500);
           } else {
@@ -972,7 +981,9 @@ class PiSession {
         this.abortRequested = false;
         this.lastUsed = Date.now();
         this.stderrTail = [];
-        this.drainQueue();
+        // 重试已排上时先别 drain: 否则队列里的消息会抢在重试前面跑,
+        // 既打乱顺序又会覆盖 lastPrompt。等重试这一轮结束自然会 drain。
+        if (!this.retryPending) this.drainQueue();
         break;
       }
       default:
@@ -1304,6 +1315,7 @@ class PiSession {
     if (this.flushTimer) { clearTimeout(this.flushTimer); this.flushTimer = null; }
     // 退避重启可能已经排上了, 必须取消, 否则会话销毁后进程又自己回来了
     if (this.respawnTimer) { clearTimeout(this.respawnTimer); this.respawnTimer = null; }
+    if (this.retryTimer) { clearTimeout(this.retryTimer); this.retryTimer = null; this.retryPending = false; }
     // 排队中的消息一旦丢弃就永远没了, 必须告诉用户, 否则他以为排上了其实石沉大海。
     // 触发场景: 闲置 30 分钟回收 / LRU 淘汰 / /reset / 关闭服务。
     // 关闭服务时不发: 进程马上退出, 消息发不出去, 只会多一条 unhandled rejection
@@ -2987,6 +2999,13 @@ async function dispatchCommand(session, cmd, arg, ctx) {
 
   if (cmd === '/stop' || cmd === '/abort') {
     session.abortRequested = true;
+    // 空回复的重试可能已经排上(500ms 后触发), 必须一起取消, 否则用户刚叫停
+    // 的那条消息 500ms 后又被自动发一遍, 看起来像 /stop 没生效。
+    if (session.retryTimer) {
+      clearTimeout(session.retryTimer);
+      session.retryTimer = null;
+      session.retryPending = false;
+    }
     session.send({ type: 'abort', id: `abort-${Date.now()}` });
     session.queue = [];
     await session.sendQQ('🛑 已请求中断。');
@@ -3004,7 +3023,8 @@ async function dispatchCommand(session, cmd, arg, ctx) {
     } catch (e) { lines.push(`状态获取失败: ${e.message}`); }
     if (session.stderrTail.length) {
       const tail = session.stderrTail.join('').trim().split('\n').slice(-3).join('\n');
-      if (tail) lines.push(`stderr:\n\`\`\`\n${tail}\n\`\`\``);
+      // QQ 不渲染 Markdown, 三反引号会原样露出来, 所以只做纯文本化
+      if (tail) lines.push(`stderr:\n${mdToPlain(tail)}`);
     }
     await session.sendQQ(lines.join('\n'));
   return true;
