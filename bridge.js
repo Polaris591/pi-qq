@@ -186,7 +186,8 @@ const ts = () => new Date().toISOString();
 const log = (...a) => { if (LOG_MIN >= LEVELS.info) console.log(ts(), '[info]', ...a); };
 const warn = (...a) => { if (LOG_MIN >= LEVELS.warn) console.error(ts(), '[warn]', ...a); };
 const error = (...a) => { if (LOG_MIN >= LEVELS.error) console.error(ts(), '[error]', ...a); };
-const debug = (...a) => { if (LOG_MIN >= LEVELS.debug) console.log(ts(), '[debug]', ...a); };
+const DEBUG_ON = LOG_MIN >= LEVELS.debug;
+const debug = (...a) => { if (DEBUG_ON) console.log(ts(), '[debug]', ...a); };
 
 // ---------------------------------------------------------------- systemd 集成
 
@@ -833,13 +834,18 @@ class PiSession {
       if (!line.length) continue;
       let rec;
       try { rec = JSON.parse(line.toString('utf8')); } catch { continue; }
-      this.onRecord(rec);
+      // 兜底: onRecord 是几十个分支的大 switch, 任何一处同步抛错都会顺着
+      // stdout 的 data 事件冒到顶层 -> uncaughtException -> fatal() -> 整个
+      // 桥接退出。单个事件处理失败不该拖死整个服务。
+      try { this.onRecord(rec); }
+      catch (e) { error(`[${this.key}] 处理 pi 事件失败 (${rec && rec.type}): ${e.message}`); }
     }
   }
 
   onRecord(rec) {
     this.lastEventAt = Date.now();
-    debug(`[${this.key}] <- pi: ${rec.type}${rec.type === 'message_update' ? `/${(rec.assistantMessageEvent || {}).type || '?'}` : ''}`);
+    // 高频路径: 关掉 debug 时不要构建模板字符串 (text_delta 一次回复几百条)
+    if (DEBUG_ON) debug(`[${this.key}] <- pi: ${rec.type}${rec.type === 'message_update' ? `/${(rec.assistantMessageEvent || {}).type || '?'}` : ''}`);
     if (rec.type === 'response' && rec.id && this.pending.has(rec.id)) {
       const { resolve, reject, timer } = this.pending.get(rec.id);
       this.pending.delete(rec.id);
@@ -918,7 +924,7 @@ class PiSession {
         this.silenceNotices = 0;
         this.lastSilenceNoticeAt = 0;
         this.busy = false;
-        debug(`[${this.key}] busy=false (agent_settled)`);
+        if (DEBUG_ON) debug(`[${this.key}] busy=false (agent_settled)`);
         // 空回复兜底: 模型偶尔会只输出思考、不给正文就结束(stopReason=stop)。
         // 桥接没东西可发, 用户那边就是彻底的静默 —— 看起来像卡死, 实际是这一轮
         // 什么都没有。必须主动说一声, 否则用户只能靠再发一条来探活。
@@ -933,7 +939,8 @@ class PiSession {
             this.sendQQ('⚠️ 上游返回了空回复，我自动重试一次…', { plain: true }).catch(() => {});
             setTimeout(() => {
               if (this.closed) return;
-              this.prompt(this.lastPrompt.message, this.lastPrompt.images, this.turnCtx);
+              const lp = this.lastPrompt;
+              this.prompt(lp.text, lp.images, lp.ctx);
             }, 500);
           } else {
             this.emptyRetries = 0;
@@ -1076,7 +1083,7 @@ class PiSession {
       p.stdin.write(`${JSON.stringify(cmd)}\n`, (err) => {
         if (err) error(`[${this.key}] 写入 pi stdin 失败: ${err.message}`);
       });
-      debug(`[${this.key}] -> pi: ${cmd.type}${cmd.id ? ` id=${cmd.id}` : ''}`);
+      if (DEBUG_ON) debug(`[${this.key}] -> pi: ${cmd.type}${cmd.id ? ` id=${cmd.id}` : ''}`);
       return true;
     } catch (e) {
       error(`[${this.key}] 写入 pi stdin 异常: ${e.message}`);
@@ -1134,8 +1141,10 @@ class PiSession {
     }
     this.busy = true;
     this.turnHadOutput = false;   // 本轮是否真的给用户发过东西
-    this.lastPrompt = { message, images };   // 空回复时用来原样重试
-    debug(`[${this.key}] busy=true (prompt)`);
+    // 存「注入记忆前缀之前」的原文与 ctx: prompt() 会再注入一次前缀,
+    // 若存 message(已含前缀)会导致重试时前缀出现两遍。
+    this.lastPrompt = { text, images, ctx };
+    if (DEBUG_ON) debug(`[${this.key}] busy=true (prompt)`);
     this.turnCtx = ctx || this.ctx || this.lastCtx;
     this.lastFlush = Date.now();
     // 新一轮开始, 重置静默提醒计数
@@ -3269,6 +3278,20 @@ async function sweepStorage() {
     }
   } catch { /* 目录不存在 */ }
 
+  // 3) outbox 的 .sent 归档: 只增不减, 时间长了也会堆
+  const sentDays = Math.max(1, Number(cfg.behavior.outboxSentRetentionDays) || 30);
+  try {
+    const sentDir = path.join(OUTBOX_HOST, '.sent');
+    for (const f of fs.readdirSync(sentDir)) {
+      const full = path.join(sentDir, f);
+      let st;
+      try { st = fs.statSync(full); } catch { continue; }
+      if (!st.isFile()) continue;
+      if (now - st.mtimeMs < sentDays * dayMs) continue;
+      try { fs.unlinkSync(full); removed++; freed += st.size; } catch { /* 同上 */ }
+    }
+  } catch { /* 目录不存在 */ }
+
   if (removed) log(`磁盘回收: 删除 ${removed} 个过期文件, 释放 ${humanSize(freed)}`);
   return removed;
 }
@@ -3389,7 +3412,7 @@ function start() {
       const now = Date.now();
       for (const [k, s] of sessions) {
         if (s.closed) continue;
-        debug(`[${k}] tick busy=${s.busy} work=${s.workLabel || '-'} idle=${Math.round((now - (s.lastOutputAt || s.lastEventAt || now)) / 1000)}s sent=${s.silenceNotices || 0}`);
+        if (DEBUG_ON) debug(`[${k}] tick busy=${s.busy} work=${s.workLabel || '-'} idle=${Math.round((now - (s.lastOutputAt || s.lastEventAt || now)) / 1000)}s sent=${s.silenceNotices || 0}`);
         // busy = 正在跑一轮 prompt; workLabel = 正在跑一个耗时的非 prompt 操作
         if (!s.busy && !s.workLabel) continue;
         const idle = now - (s.lastOutputAt || s.lastEventAt || now);

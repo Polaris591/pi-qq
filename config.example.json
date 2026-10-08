@@ -62,7 +62,8 @@
     "inboxRetentionDays": 7,
     "storageSweepMs": 21600000,
     "spawnQuickExitMs": 10000,
-    "spawnMaxBackoffMs": 300000
+    "spawnMaxBackoffMs": 300000,
+    "outboxSentRetentionDays": 30
   },
   "persona": {
     "text": "",

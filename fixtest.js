@@ -489,6 +489,44 @@ const ok = (name, pass, extra) => { results.push({ name, pass }); console.log(`$
     s.closed = true;
   }
 
+  // ---- 修复 16: onRecord 抛错不能拖死整个桥接
+  {
+    const s = new B.PiSession('private_70', { type: 'private', id: '70' });
+    s.proc = { stdin: { writable: true, write: (d, cb) => { if (cb) cb(null); }, on: () => {} } };
+    let calls = 0;
+    s.onRecord = () => { calls++; throw new Error('模拟分支抛错'); };
+    let threw = false;
+    try { s.onStdout(Buffer.from('{"type":"message_update"}\n{"type":"agent_settled"}\n')); }
+    catch { threw = true; }
+    ok('onRecord 抛错不会外泄', !threw);
+    ok('抛错后仍继续处理后续事件', calls === 2, `calls=${calls}`);
+    s.closed = true;
+  }
+
+  // ---- 修复 17: .sent 归档纳入回收
+  {
+    const fsx = require('fs');
+    const pathx = require('path');
+    const sentDir = pathx.join(B.cfg.files.outboxDir, '.sent');
+    fsx.mkdirSync(sentDir, { recursive: true });
+    const now = Date.now();
+    const oldT = new Date(now - 40 * 24 * 3600 * 1000);
+    const newT = new Date(now - 1 * 24 * 3600 * 1000);
+    const fOld = pathx.join(sentDir, 'old-delivered.txt');
+    const fNew = pathx.join(sentDir, 'new-delivered.txt');
+    fsx.writeFileSync(fOld, 'x'); fsx.writeFileSync(fNew, 'x');
+    fsx.utimesSync(fOld, oldT, oldT); fsx.utimesSync(fNew, newT, newT);
+
+    B.cfg.behavior.sessionRetentionDays = 30;
+    B.cfg.behavior.inboxRetentionDays = 7;
+    B.cfg.behavior.outboxSentRetentionDays = 30;
+    await B.sweepStorage();
+
+    ok('删掉过期的 .sent 归档', !fsx.existsSync(fOld));
+    ok('保留未过期的 .sent 归档', fsx.existsSync(fNew));
+    try { fsx.unlinkSync(fNew); } catch {}
+  }
+
   console.log('\n===== 结果 =====');
   const bad = results.filter((r) => !r.pass);
   console.log(`通过 ${results.length - bad.length}/${results.length}`);
