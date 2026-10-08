@@ -2279,6 +2279,9 @@ function pickIndex(arg, len) {
 }
 
 const THINK_ALIAS = new Set(['/thinking', '/reasoning', '/reason', '/think', '/思考']);
+// 思考等级的常见取值。pi 会通过 get_available_thinking_levels 返回, 这里只是兜底,
+// 用来识别「用户把等级名当成模型名敲进了 /model」这类误用。
+const THINK_LEVEL_HINTS = new Set(['off', 'none', 'minimal', 'low', 'medium', 'mid', 'high', 'max', 'ultra']);
 
 /**
  * 拉取群内最近消息作为背景上下文。
@@ -2847,7 +2850,19 @@ async function dispatchCommand(session, cmd, arg, ctx) {
         const i = arg.indexOf('/');
         target = { provider: arg.slice(0, i), id: arg.slice(i + 1) };
       }
-      if (!target) { await session.sendQQ('⚠️ 用法: /model 或 /model 序号 或 /model provider/model'); return true; }
+      if (!target) {
+        // 最常见的误用: 把思考等级当模型名敲进来 (/model high)。直接点破,
+        // 比甩一句「用法: ...」有用 —— 用户本来就想干这件事, 只是敲错了命令。
+        const lv = String(arg || '').trim().toLowerCase();
+        const isLevel = (d.levels || []).some((x) => String(x).toLowerCase() === lv)
+          || THINK_LEVEL_HINTS.has(lv);
+        if (isLevel) {
+          await session.sendQQ(`⚠️ ${arg} 是思考等级，不是模型名。要用 /thinking ${arg}`);
+          return true;
+        }
+        await session.sendQQ('⚠️ 用法: /model 或 /model 序号 或 /model provider/model');
+        return true;
+      }
       const after = await session.setModel(target.provider, target.id);
       await session.sendQQ([
         `🧠 已切换模型: ${after.model ? `${after.model.provider}/${after.model.id}` : `${target.provider}/${target.id}`}`,
@@ -2870,6 +2885,13 @@ async function dispatchCommand(session, cmd, arg, ctx) {
         return true;
       }
       const level = arg.toLowerCase();
+      // 反向误用: 把模型名敲进了 /thinking
+      const looksLikeModel = level.includes('/')
+        || (session.lastModelList || []).some((m) => String(m.id || '').toLowerCase() === level);
+      if (looksLikeModel) {
+        await session.sendQQ(`⚠️ ${arg} 看着是模型名，不是思考等级。要用 /model ${arg}`);
+        return true;
+      }
       if (d.levels.length && !d.levels.includes(level)) {
         await session.sendQQ(`⚠️ 该模型仅支持: ${d.levels.join(' / ')}`);
         return true;

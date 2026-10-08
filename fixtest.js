@@ -803,6 +803,57 @@ const ok = (name, pass, extra) => { results.push({ name, pass }); console.log(`$
     ok('损坏记录不抛错', B.takeRestartMark() === null);
   }
 
+  // ---- 修复 27: 命令误用要点破, 不要只甩一句「用法: ...」
+  {
+    const sent = [];
+    const fake = {
+      key: 'private_31', busy: false, queue: [], lastResumeList: null, lastModelList: null,
+      stderrTail: [], beginWork() {}, endWork() {},
+      sendQQ: async (t) => { sent.push(String(t)); return { status: 'ok' }; },
+      request: async () => ({ models: [], levels: [] }),
+      describeModel: async () => ({
+        model: { provider: 'p', id: 'm' }, thinkingLevel: 'high', levels: ['high', 'max'],
+      }),
+      setModel: async () => ({ model: { provider: 'p', id: 'm' }, thinkingLevel: 'high', levels: ['high', 'max'] }),
+      send: () => true, abortRequested: false,
+    };
+    const ctx = { isGroup: false, userId: '123456789', groupId: '', userName: '主人', key: 'private_31' };
+
+    // 把思考等级当模型名
+    sent.length = 0;
+    await B.dispatchCommand(fake, '/model', 'high', ctx);
+    ok('/model high 点破是思考等级',
+      sent.some((t) => t.includes('思考等级') && t.includes('/thinking high')), JSON.stringify(sent));
+
+    // 把模型名当思考等级
+    sent.length = 0;
+    fake.lastModelList = [{ provider: 'workbuddy', id: 'deepseek' }];
+    await B.dispatchCommand(fake, '/thinking', 'deepseek', ctx);
+    ok('/thinking deepseek 点破是模型名',
+      sent.some((t) => t.includes('模型名') && t.includes('/model deepseek')), JSON.stringify(sent));
+
+    // 带斜杠的也认得出是模型
+    sent.length = 0;
+    await B.dispatchCommand(fake, '/thinking', 'workbuddy/deepseek', ctx);
+    ok('/thinking provider/model 也点破', sent.some((t) => t.includes('模型名')), JSON.stringify(sent));
+
+    // 正常用法不该被误判
+    sent.length = 0;
+    await B.dispatchCommand(fake, '/model', 'p/m', ctx);
+    ok('正常 /model provider/model 不被误判', !sent.some((t) => t.includes('思考等级')),
+      JSON.stringify(sent).slice(0, 200));
+
+    sent.length = 0;
+    await B.dispatchCommand(fake, '/thinking', 'max', ctx);
+    ok('正常 /thinking max 不被误判', !sent.some((t) => t.includes('模型名')),
+      JSON.stringify(sent).slice(0, 200));
+
+    // 真不认识的东西仍然走原提示
+    sent.length = 0;
+    await B.dispatchCommand(fake, '/model', 'zzz', ctx);
+    ok('无效参数仍给用法提示', sent.some((t) => t.includes('用法: /model')), JSON.stringify(sent));
+  }
+
   console.log('\n===== 结果 =====');
   const bad = results.filter((r) => !r.pass);
   console.log(`通过 ${results.length - bad.length}/${results.length}`);
