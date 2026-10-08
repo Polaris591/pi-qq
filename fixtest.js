@@ -30,7 +30,7 @@ fs.writeFileSync(path.join(BASE, 'config.json'), JSON.stringify({
 
 const src = fs.readFileSync(path.join(__dirname, 'bridge.js'), 'utf8');
 fs.writeFileSync(path.join(BASE, 'bridge.js'), `${src}
-module.exports = { PiSession, sessions, alertTarget, cfg, onebot, fetchGroupContext, GROUP_CTX_CACHE, sweepStorage, STATE, dispatchCommand, HELP };
+module.exports = { PiSession, sessions, alertTarget, cfg, onebot, fetchGroupContext, GROUP_CTX_CACHE, sweepStorage, STATE, dispatchCommand, HELP, requestRestart, maybeRestartNow, busySessionCount, setExitHook, restartState };
 `);
 
 const results = [];
@@ -645,6 +645,45 @@ const ok = (name, pass, extra) => { results.push({ name, pass }); console.log(`$
     await new Promise((r) => setTimeout(r, 700));
     ok('销毁后不重发', c.prompts.filter((x) => x === '销毁前').length === 1,
       JSON.stringify(c.prompts));
+  }
+
+  // ---- 修复 21: 延迟重启 (不能把正在跑的那一轮掐死)
+  {
+    const exits = [];
+    B.setExitHook((reason) => { exits.push(reason); });
+    B.cfg.behavior.restartMaxWaitMs = 300000;
+
+    const s = new B.PiSession('private_95', { type: 'private', id: '95' });
+    B.sessions.set('private_95', s);
+    s.sendQQ = async () => ({ status: 'ok' });
+    s.send = () => true;
+    s.proc = { stdin: { writable: true, write: (d, cb) => { if (cb) cb(null); }, on: () => {} } };
+    s.prompt('长任务', [], { replyTo: null, atUser: null });      // busy = true
+
+    ok('busySessionCount 认得忙碌会话', B.busySessionCount() === 1, `n=${B.busySessionCount()}`);
+
+    B.requestRestart('测试');
+    ok('重启请求已记下', B.restartState().pending !== null);
+
+    // 已有请求排队时, 再来一个不该顶掉前面的 (否则等待计时会被无限刷新)
+    const at0 = B.restartState().pending.at;
+    B.requestRestart('第二个请求');
+    ok('已有请求时忽略新的', B.restartState().pending.at === at0 && B.restartState().pending.reason === '测试',
+      JSON.stringify(B.restartState().pending));
+
+    await new Promise((r) => setTimeout(r, 2500));
+    ok('会话忙碌时不重启', exits.length === 0, JSON.stringify(exits));
+
+    // 会话空闲后, 这一轮跑完了才该重启
+    s.busy = false;
+    B.maybeRestartNow();
+    await new Promise((r) => setTimeout(r, 2600));
+    ok('空闲后执行重启', exits.length === 1 && String(exits[0]).includes('restart'),
+      JSON.stringify(exits));
+
+    B.sessions.delete('private_95');
+    s.closed = true;
+    B.setExitHook(null);
   }
 
   console.log('\n===== 结果 =====');

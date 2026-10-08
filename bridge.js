@@ -984,6 +984,8 @@ class PiSession {
         // 重试已排上时先别 drain: 否则队列里的消息会抢在重试前面跑,
         // 既打乱顺序又会覆盖 lastPrompt。等重试这一轮结束自然会 drain。
         if (!this.retryPending) this.drainQueue();
+        // 排上过重启请求的话, 这一轮结束、队列也 drain 完了才是重启的时机
+        maybeRestartNow();
         break;
       }
       default:
@@ -2947,12 +2949,13 @@ async function dispatchCommand(session, cmd, arg, ctx) {
       await session.sendQQ('⛔ /restart 仅限主人私聊使用。');
       return true;
     }
-    await session.sendQQ('🔄 正在重启桥接，约 5 秒后回来…');
-    log(`[${key}] 用户请求重启桥接, 主动退出交由 systemd 拉起`);
-    // systemd 配了 Restart=always, 所以优雅退出即可被重新拉起。
-    // 比 spawn systemctl 可靠: 不会因为自身被 SIGTERM 而连带杀掉重启命令。
-    // 延迟 1.5 秒, 先把上面那句「正在重启」发出去。
-    setTimeout(() => { shutdown('user /restart'); }, 1500);
+    // 不能立刻退出: 这一轮对话可能还在跑, 直接退会把任务和回复一起丢掉。
+    // requestRestart 会等所有会话空闲(回复已发出)之后再退出, systemd 负责拉起。
+    requestRestart('user /restart');
+    const busy = busySessionCount();
+    await session.sendQQ(busy
+      ? `🔄 收到。还有 ${busy} 个会话在跑，等跑完就重启（回复会先发出来）。`
+      : '🔄 正在重启桥接，约 5 秒后回来…');
   return true;
   }
   if (cmd === '/reset') {
@@ -3346,6 +3349,62 @@ let turnTimer = null;
 let silenceTimer = null;
 let watchdogTimer = null;
 let shuttingDown = false;
+let restartTimer = null;
+let restartScheduled = false;
+
+// ---------------------------------------------------------------- 延迟重启
+//
+// 问题: pi 子进程承载着正在进行的那一轮对话。直接 `systemctl restart pi-qq`
+// 会把它连同这一轮一起杀掉 —— 表现就是「重启之后任务中断、回复也没了」。
+// 而「改完代码要重启才生效」这件事偏偏只能在那一轮里做, 等于自己掐死自己。
+//
+// 做法: 重启请求先记下来, 等所有会话都空闲(这一轮跑完、回复也发出去了)再真正
+// 退出。两条触发路径都走这里:
+//   1. 用户在 QQ 里发 /restart
+//   2. pi 子进程写一个请求文件 (它没法直接让父进程重启)
+// 会话文件本身不受影响, 重启后 pi 会从同一个文件恢复上下文。
+const RESTART_FLAG = path.join(path.dirname(OUTBOX_HOST), '.restart-request');
+let pendingRestart = null;   // { at, reason }
+// 测试接缝: 回归测试里不能让 maybeRestartNow 真的把测试进程关掉
+let exitHook = null;
+function setExitHook(fn) { exitHook = fn || null; }
+
+function busySessionCount() {
+  let n = 0;
+  for (const [, s] of sessions) if (s.busy) n++;
+  return n;
+}
+
+/** 供测试与 /status 观察当前重启排队状态 */
+function restartState() { return { pending: pendingRestart, scheduled: restartScheduled }; }
+
+function requestRestart(reason) {
+  if (shuttingDown) return;
+  if (pendingRestart) { log(`重启请求已在排队 (${pendingRestart.reason}), 忽略新的: ${reason}`); return; }
+  pendingRestart = { at: Date.now(), reason };
+  log(`收到重启请求 (${reason}), 等所有会话空闲后执行`);
+  maybeRestartNow();
+}
+
+/** 空闲就重启, 忙就继续等 (超过 restartMaxWaitMs 强制重启, 避免永远等下去) */
+function maybeRestartNow() {
+  if (shuttingDown || !pendingRestart || restartScheduled) return;
+  const maxWait = Math.max(30000, Number(cfg.behavior.restartMaxWaitMs) || 300000);
+  const waited = () => Date.now() - (pendingRestart ? pendingRestart.at : Date.now());
+  const busy = busySessionCount();
+  if (busy && waited() < maxWait) return;
+  if (busy) warn(`重启已等待 ${Math.round(waited() / 1000)}s, 仍有 ${busy} 个会话在跑, 强制重启`);
+  const reason = pendingRestart.reason;
+  restartScheduled = true;
+  // 留 2 秒让最后几段 flush 发完 (flush 内部每段之间还有 sleep)
+  setTimeout(() => {
+    if (busySessionCount() && waited() < maxWait) {
+      restartScheduled = false;   // 这 2 秒里又来了活, 回去接着等
+      return;
+    }
+    (exitHook || shutdown)(`restart: ${reason}`);
+  }, 2000);
+}
 
 /** 有界重启: 先把「必然报错且与网络无关」的本地 fd 问题挡掉, 再交还 systemd 重启 */
 function fatal(kind, e) {
@@ -3372,6 +3431,18 @@ function start() {
   ensureDir(INBOX_DIR);
   outboxTimer = setInterval(() => { sweepOutbox().catch((e) => warn(`outbox 巡检出错: ${e.message}`)); }, OUTBOX_POLL_MS);
   outboxTimer.unref();
+  // 上一轮进程留下的重启请求已无意义 (进程都重启过了), 直接清掉
+  try { if (fs.existsSync(RESTART_FLAG)) fs.unlinkSync(RESTART_FLAG); } catch {}
+  restartTimer = setInterval(() => {
+    try {
+      if (fs.existsSync(RESTART_FLAG)) {
+        fs.unlinkSync(RESTART_FLAG);
+        requestRestart('pi 请求重启 (标志文件)');
+      }
+    } catch (e) { warn(`读取重启标志失败: ${e.message}`); }
+    maybeRestartNow();
+  }, 2000);
+  restartTimer.unref();
   log(`outbox 监控: ${OUTBOX_HOST} (容器内 ${OUTBOX_CTR}, 每 ${OUTBOX_POLL_MS}ms)`);
 
   // 定时任务: 先算一遍 nextRun, 之后定期巡检 (到点触发)
@@ -3498,6 +3569,7 @@ async function shutdown(reason) {
   if (turnTimer) clearInterval(turnTimer);
   if (silenceTimer) clearInterval(silenceTimer);
   if (watchdogTimer) clearInterval(watchdogTimer);
+  if (restartTimer) clearInterval(restartTimer);
   for (const [, s] of sessions) await s.destroy('shutdown');
   process.exit(0);
 }
@@ -3510,5 +3582,8 @@ process.on('SIGINT', shutdown);
 if (require.main === module) {
   start();
 } else {
-  module.exports = { start, fatal, onebot, sessions };
+  module.exports = {
+    start, fatal, onebot, sessions,
+    requestRestart, maybeRestartNow, busySessionCount, setExitHook, restartState,
+  };
 }
