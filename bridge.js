@@ -2737,6 +2737,7 @@ async function handleIncoming(rec) {
 
   // 给触发消息贴表情 (仅群聊, 失败不影响主流程)
   if (cfg.behavior.emojiReaction && (cfg.behavior.emojiReactionScope === 'all' || isGroup)) {
+    // 这是「已收到」的信号, 用户靠它判断我到底有没有在处理 —— 失败必须留痕
     onebot.action('set_msg_emoji_like', {
       message_id: rec.message_id, emoji_id: Number(cfg.behavior.emojiReaction),
     }).catch((e) => warn(`贴表情失败: ${e.message}`));
