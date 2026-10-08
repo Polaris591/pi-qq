@@ -1526,9 +1526,19 @@ const onebot = {
           this.selfId = String(r.data.user_id);
           log(`登录账号: ${this.selfId} (${r.data.nickname})`);
           if (qqDown) qqRecovered();
-          if (cfg.behavior.startupNotice) {
+          // 重启确认优先于普通的「已上线」: 它是对用户刚做过的动作的回应,
+          // 不是主动插话。用户等了十几秒, 需要知道到底成没成。
+          let notice = null;
+          if (restartMark && cfg.behavior.restartNotice !== false) {
+            const sec = Math.max(1, Math.round((Date.now() - restartMark.at) / 1000));
+            notice = `✅ 桥接已重启完成\n原因: ${restartMark.reason}\n中断: ${sec} 秒`;
+            restartMark = null;
+          } else if (cfg.behavior.startupNotice) {
+            notice = '🟢 pi-qq 桥接已上线';
+          }
+          if (notice) {
             for (const id of PRIVATE_ALLOW) {
-              this.action('send_private_msg', { user_id: Number(id), message: '🟢 pi-qq 桥接已上线' }).catch(() => {});
+              this.action('send_private_msg', { user_id: Number(id), message: notice }).catch(() => {});
             }
           }
         }
@@ -3388,6 +3398,26 @@ let restartScheduled = false;
 //   2. pi 子进程写一个请求文件 (它没法直接让父进程重启)
 // 会话文件本身不受影响, 重启后 pi 会从同一个文件恢复上下文。
 const RESTART_FLAG = path.join(path.dirname(OUTBOX_HOST), '.restart-request');
+// 重启前写下一条记录, 新进程启动后据此发一条「重启完成」—— 否则用户看到的
+// 只是一段沉默, 分不清是重启成功还是服务没起来。
+const RESTART_MARK = path.join(path.dirname(OUTBOX_HOST), '.last-restart.json');
+let restartMark = null;   // 本次启动读到的重启记录
+
+function markRestart(reason) {
+  try { fs.writeFileSync(RESTART_MARK, JSON.stringify({ at: Date.now(), reason })); }
+  catch { /* 写不了只是少一条通知, 不影响重启本身 */ }
+}
+
+/** 读取并清掉重启记录; 太旧的说明上次不是正常重启, 不提示 */
+function takeRestartMark() {
+  let d = null;
+  try {
+    d = JSON.parse(fs.readFileSync(RESTART_MARK, 'utf8'));
+    fs.unlinkSync(RESTART_MARK);
+  } catch { return null; }
+  if (!d || !d.at || Date.now() - d.at > 10 * 60 * 1000) return null;
+  return d;
+}
 let pendingRestart = null;   // { at, reason }
 // 测试接缝: 回归测试里不能让 maybeRestartNow 真的把测试进程关掉
 let exitHook = null;
@@ -3465,6 +3495,7 @@ function start() {
   outboxTimer.unref();
   // 上一轮进程留下的重启请求已无意义 (进程都重启过了), 直接清掉
   try { if (fs.existsSync(RESTART_FLAG)) fs.unlinkSync(RESTART_FLAG); } catch {}
+  restartMark = takeRestartMark();
   restartTimer = setInterval(() => {
     try {
       if (fs.existsSync(RESTART_FLAG)) {
@@ -3593,6 +3624,10 @@ async function shutdown(reason) {
   if (shuttingDown) return;
   shuttingDown = true;
   notify('STOPPING=1');
+  // 主动重启和 systemd 重启都记一笔, 好让新进程知道「这次是有意的重启」
+  if (reason == null || String(reason).startsWith('restart')) {
+    markRestart(reason == null ? 'systemd' : String(reason));
+  }
   log(`正在关闭...${typeof reason === 'string' && reason ? ` (${reason})` : ''}`);
   if (outboxTimer) clearInterval(outboxTimer);
   if (storageTimer) clearInterval(storageTimer);
@@ -3617,5 +3652,6 @@ if (require.main === module) {
   module.exports = {
     start, fatal, onebot, sessions,
     requestRestart, maybeRestartNow, busySessionCount, setExitHook, restartState, getSession,
+    markRestart, takeRestartMark, RESTART_MARK,
   };
 }

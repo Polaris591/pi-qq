@@ -30,7 +30,7 @@ fs.writeFileSync(path.join(BASE, 'config.json'), JSON.stringify({
 
 const src = fs.readFileSync(path.join(__dirname, 'bridge.js'), 'utf8');
 fs.writeFileSync(path.join(BASE, 'bridge.js'), `${src}
-module.exports = { PiSession, sessions, alertTarget, cfg, onebot, fetchGroupContext, GROUP_CTX_CACHE, sweepStorage, STATE, dispatchCommand, HELP, requestRestart, maybeRestartNow, busySessionCount, setExitHook, restartState, mdToPlain, getSession, creatingSessions };
+module.exports = { PiSession, sessions, alertTarget, cfg, onebot, fetchGroupContext, GROUP_CTX_CACHE, sweepStorage, STATE, dispatchCommand, HELP, requestRestart, maybeRestartNow, busySessionCount, setExitHook, restartState, mdToPlain, getSession, creatingSessions, markRestart, takeRestartMark, RESTART_MARK };
 `);
 
 const results = [];
@@ -779,6 +779,28 @@ const ok = (name, pass, extra) => { results.push({ name, pass }); console.log(`$
     B.sessions.clear();
     B.creatingSessions.clear();
     B.cfg.behavior.maxSessions = savedMax;
+  }
+
+  // ---- 修复 26: 重启完成要有确认, 不能只留一段沉默
+  {
+    const fsx = require('fs');
+    try { fsx.unlinkSync(B.RESTART_MARK); } catch {}
+    ok('没有记录时返回 null', B.takeRestartMark() === null);
+
+    B.markRestart('restart: 测试');
+    ok('标记文件已写下', fsx.existsSync(B.RESTART_MARK));
+    const m = B.takeRestartMark();
+    ok('能读回重启原因', m && m.reason === 'restart: 测试', JSON.stringify(m));
+    ok('读一次就清掉(不会重复通知)', !fsx.existsSync(B.RESTART_MARK));
+    ok('清掉后再读为 null', B.takeRestartMark() === null);
+
+    // 太旧的记录不提示(说明上次不是正常重启)
+    fsx.writeFileSync(B.RESTART_MARK, JSON.stringify({ at: Date.now() - 30 * 60 * 1000, reason: 'old' }));
+    ok('过期记录不提示', B.takeRestartMark() === null);
+
+    // 损坏的记录不能抛错
+    fsx.writeFileSync(B.RESTART_MARK, 'not json');
+    ok('损坏记录不抛错', B.takeRestartMark() === null);
   }
 
   console.log('\n===== 结果 =====');
