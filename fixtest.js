@@ -30,7 +30,7 @@ fs.writeFileSync(path.join(BASE, 'config.json'), JSON.stringify({
 
 const src = fs.readFileSync(path.join(__dirname, 'bridge.js'), 'utf8');
 fs.writeFileSync(path.join(BASE, 'bridge.js'), `${src}
-module.exports = { PiSession, sessions, alertTarget, cfg, onebot, fetchGroupContext, GROUP_CTX_CACHE, sweepStorage, STATE, dispatchCommand, HELP, requestRestart, maybeRestartNow, busySessionCount, setExitHook, restartState, mdToPlain, getSession, creatingSessions, markRestart, takeRestartMark, RESTART_MARK, normalizeTask, runShell };
+module.exports = { PiSession, sessions, alertTarget, cfg, onebot, fetchGroupContext, GROUP_CTX_CACHE, sweepStorage, STATE, dispatchCommand, HELP, requestRestart, maybeRestartNow, busySessionCount, setExitHook, restartState, mdToPlain, getSession, creatingSessions, markRestart, takeRestartMark, RESTART_MARK, normalizeTask, runShell, TASKS, mergeTaskFiles };
 `);
 
 const results = [];
@@ -1009,6 +1009,23 @@ const ok = (name, pass, extra) => { results.push({ name, pass }); console.log(`$
     sent.length = 0;
     await B.dispatchCommand(fake, '/memory', 'apply', { ...ctx, isGroup: true });
     ok('群聊里拒绝应用记忆整理', sent.some((t) => t.includes('私聊')), JSON.stringify(sent));
+  }
+
+  // ---- 修复 31: 任务文件校验不过时不能被静默删掉
+  {
+    const tdir = path.join(BASE, 'tasks');
+    fs.mkdirSync(tdir, { recursive: true });
+    // 一份合法的 + 一份缺字段的
+    fs.writeFileSync(path.join(tdir, 'good.json'),
+      JSON.stringify({ id: 'good-task', target: 'private_123456789', schedule: { type: 'daily', time: '07:00' }, prompt: '说话' }));
+    fs.writeFileSync(path.join(tdir, 'broken.json'),
+      JSON.stringify({ id: 'broken-task', target: 'private_123456789', schedule: { type: 'daily', time: '07:00' } }));
+    B.mergeTaskFiles();
+    ok('合法任务被加载', (B.TASKS || []).some((t) => t.id === 'good-task'));
+    ok('合法任务文件被消费掉', !fs.existsSync(path.join(tdir, 'good.json')));
+    ok('不合法的任务文件必须留着', fs.existsSync(path.join(tdir, 'broken.json')),
+      '文件被静默删掉了 —— 用户写的任务就这么没了');
+    fs.rmSync(path.join(tdir, 'broken.json'), { force: true });
   }
 
   console.log('\n===== 结果 =====');

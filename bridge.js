@@ -2186,6 +2186,15 @@ function normalizeTask(raw, source) {
 }
 
 /** 读取 pi 写入的任务目录并与内存/持久化列表合并 (同 id 以文件内容为准) */
+// 任务文件校验失败时每 20 秒会重扫一次, 告警要去重, 否则日志会被刷满
+const taskFileWarnAt = new Map();
+function warnTaskFileOnce(key, msg) {
+  const now = Date.now();
+  if (now - (taskFileWarnAt.get(key) || 0) < 30 * 60 * 1000) return;
+  taskFileWarnAt.set(key, now);
+  warn(msg);
+}
+
 function mergeTaskFiles() {
   let files = [];
   try { files = fs.readdirSync(TASKS_DIR).filter((f) => f.endsWith('.json')); } catch { return false; }
@@ -2195,9 +2204,10 @@ function mergeTaskFiles() {
     let raw;
     try { raw = JSON.parse(fs.readFileSync(full, 'utf8')); } catch (e) { warn(`任务文件解析失败 ${f}: ${e.message}`); continue; }
     const list = Array.isArray(raw) ? raw : [raw];
+    let bad = 0;
     for (const item of list) {
       const t = normalizeTask(item, f);
-      if (!t) continue;
+      if (!t) { bad++; continue; }
       const idx = TASKS.findIndex((x) => x.id === t.id);
       if (idx >= 0) {
         // 保留运行记录, 其余字段以文件为准
@@ -2208,6 +2218,12 @@ function mergeTaskFiles() {
         log(`新增定时任务: ${t.id} (${t.schedule.type}) -> ${t.target.type}_${t.target.id}`);
       }
       changed = true;
+    }
+    // 校验不过就别删文件。之前这里是无条件 unlink, 结果一份写错字段的任务文件
+    // 会一声不吭地消失 —— 用户以为任务还在, 其实早被删了。宁可每轮重复告警。
+    if (bad) {
+      warnTaskFileOnce(`taskbad:${f}`, `任务文件 ${f} 有 ${bad} 条不合法, 已保留原文件, 请修正后重新加载`);
+      continue;
     }
     try { fs.unlinkSync(full); } catch { /* 删除失败则下轮重复合并, 幂等 */ }
   }
