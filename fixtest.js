@@ -699,6 +699,24 @@ const ok = (name, pass, extra) => { results.push({ name, pass }); console.log(`$
     ok('行内代码去反引号', c === '用 npm test 跑', JSON.stringify(c));
   }
 
+  // ---- 修复 23: 单条上报抛错不能拖死桥接, 也不该连累同一批里的其他行
+  {
+    const calls = [];
+    const orig = B.onebot.onRecord;
+    B.onebot.onRecord = (rec) => {
+      calls.push(rec.post_type || ('echo:' + rec.echo));
+      if (calls.length === 1) throw new Error('模拟上报处理抛错');   // 只抛第一行
+    };
+    let outerThrew = false;
+    try {
+      B.onebot.handleWsMessage(
+        Buffer.from('{"post_type":"message"}\n{"echo":7}\n{"post_type":"meta_event"}\n'));
+    } catch { outerThrew = true; }
+    ok('单条上报抛错不外泄', !outerThrew);
+    ok('抛错后同批其余行照常处理', calls.length === 3, JSON.stringify(calls));
+    B.onebot.onRecord = orig;
+  }
+
   console.log('\n===== 结果 =====');
   const bad = results.filter((r) => !r.pass);
   console.log(`通过 ${results.length - bad.length}/${results.length}`);

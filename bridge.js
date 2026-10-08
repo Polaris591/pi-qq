@@ -65,7 +65,7 @@ const cfg = {
   },
   behavior: {
     maxSessions: 5, idleTimeoutMs: 30 * 60 * 1000, maxChars: 2500,
-    flushIntervalMs: 6000, progressOnToolCall: true, thinkingReaction: true,
+    flushIntervalMs: 6000, progressOnToolCall: true,
     startupNotice: true,
     // 群聊回复形态: quote+at(引用并@) / at(仅@) / quote(仅引用) / plain(纯文本)
     groupReplyMode: 'quote+at',
@@ -1075,22 +1075,6 @@ class PiSession {
     return onebot.action('send_group_msg', { group_id: Number(this.target.id), message: segs });
   }
 
-  /** 把文件发给当前会话 */
-  async sendFile(hostPath, displayName) {
-    try {
-      await deliverFile(this.target, hostPath, displayName);
-      return true;
-    } catch (e) {
-      await this.sendQQ(`❌ 发送文件失败: ${e.message}`, { plain: true });
-      return false;
-    }
-  }
-
-  /** 把图片以图片段发出 */
-  async sendImage(hostPath) {
-    return deliverImage(this.target, hostPath, this.ctx || this.lastCtx);
-  }
-
   /**
    * 标记一个「不算 busy 但同样耗时的操作」, 让静默提醒能覆盖到。
    * 例如 /compact 可能跑三分钟、/new 与 /resume 要重新握手 pi ——
@@ -1524,14 +1508,7 @@ const onebot = {
       }).catch(() => {});
     });
 
-    ws.on('message', (data) => {
-      for (const line of data.toString('utf8').split('\n')) {
-        if (!line.trim()) continue;
-        let rec;
-        try { rec = JSON.parse(line); } catch { continue; }
-        this.onRecord(rec);
-      }
-    });
+    ws.on('message', (data) => this.handleWsMessage(data));
 
     ws.on('close', (code) => {
       warn(`NapCat WebSocket 断开 code=${code}, 5 秒后重连`);
@@ -1548,6 +1525,23 @@ const onebot = {
       setTimeout(() => { this.reconnecting = false; this.connect(); }, 5000);
     });
     ws.on('error', (e) => warn(`NapCat WebSocket 错误: ${e.message}`));
+  },
+
+  /**
+   * 处理 NapCat 推来的一批数据 (按行分隔的 JSON)。
+   * 抽成方法是为了能直接测 —— 之前这段逻辑藏在 ws 回调里, 没法验证。
+   */
+  handleWsMessage(data) {
+    for (const line of String(data).split('\n')) {
+      if (!line.trim()) continue;
+      let rec;
+      try { rec = JSON.parse(line); } catch { continue; }
+      // 和 PiSession.onStdout 同样的兜底: onRecord 里分支很多, 同步抛错会顺着
+      // 事件回调冒到顶层 -> uncaughtException -> fatal() -> 整个桥接退出。
+      // 一条上报处理失败不该拖死服务, 也不该连累同一批里的其他行。
+      try { this.onRecord(rec); }
+      catch (e) { error(`处理上报失败 (${rec && rec.post_type ? rec.post_type : '?'}): ${e.message}`); }
+    }
   },
 
   onRecord(rec) {
@@ -3071,14 +3065,6 @@ function fetchBinary(url, depth = 0) {
 }
 
 // ---------------------------------------------------------------- 文件收发
-
-/** 把文件上传到 NapCat 本地缓存, 返回 file_id (可选, 仅 NapCat 扩展上传接口需要) */
-async function uploadFile(containerPath, name) {
-  const r = await onebot.action('upload_file', {
-    file: containerPath, name, folder: '', upload_file: true,
-  }, 180000);
-  return (r && r.data && r.data.file_id) || '';
-}
 
 /** 把文件发送到指定会话 (NapCat 读不到宿主路径, 需经 OneBot 上传) */
 async function deliverFile(target, hostPath, displayName) {
