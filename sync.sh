@@ -18,7 +18,7 @@ RUN_DIR="${RUN_DIR:-/opt/pi-qq}"
 PUB_DIR="${PUB_DIR:-/opt/pi-qq-repo}"
 
 # 需要通用化的文件 (运行版 -> 开源版 会做替换)
-FILES=(bridge.js utest.js itest.js APPEND_SYSTEM.md config.example.json)
+FILES=(bridge.js utest.js itest.js fixtest.js config.example.json)
 
 # 从运行版原样复制、不做替换的文件
 COPY_AS_IS=(LICENSE .gitignore)

@@ -84,6 +84,8 @@ const cfg = {
     missedWindowMs: 30 * 60 * 1000,
     // 同一会话同时排队等待处理的消息条数上限 (超出丢弃并提示)
     maxQueue: 5,
+    // 群上下文缓存 TTL: 每次被 @ 都重拉 60 条历史并逐条解析太贵, 0 关闭缓存
+    groupContextCacheMs: 30 * 1000,
     // 群聊上下文: 被 @ 时拉取最近 N 条群消息作为背景注入 (0 关闭), 单条截断字数
     groupContextCount: 60,
     groupContextMaxChars: 500,
@@ -93,6 +95,11 @@ const cfg = {
     heartbeatTimeoutMs: 90000,
     // 单轮看门狗: pi 处于 busy 且该毫秒数内没有任何事件 => 判定卡死, 强制打断, 0 关闭
     turnTimeoutMs: 45 * 60 * 1000,
+    // 静默提醒: pi 处于 busy 且该毫秒数内没有任何输出 => 发一条「还在跑」, 0 关闭
+    // 模型长思考或长命令执行时, 桥接没有任何 text_delta 可发, 用户会以为死了。
+    silenceNoticeMs: 60 * 1000,
+    // 单轮内最多提醒几次, 避免长任务刷屏
+    silenceNoticeMax: 5,
     // 自愈巡检间隔: WS 已死且长时间无上报时主动退出, 交由 systemd 拉起
     selfHealMs: 120000,
     ...(config.behavior || {}),
@@ -579,12 +586,14 @@ class PiSession {
     this.busy = false;
     this.queue = [];
     this.maxQueue = Math.max(1, Number(cfg.behavior.maxQueue) || 5);
-    this.lastQueueWarn = 0;
-    this.queueWarnAt = new Map();   // 每个发言人上次收到排队提示的时间 (避免刷屏)
+    this.lastQueueWarn = 0;    this.queueWarnAt = new Map();   // 每个发言人上次收到排队提示的时间 (避免刷屏)
     this.lastFlush = Date.now();
     this.lastUsed = Date.now();
     this.flushTimer = null;
     this.closed = false;
+    // 静默提醒用: 本轮已提醒次数与上次提醒时刻
+    this.silenceNotices = 0;
+    this.lastSilenceNoticeAt = 0;
     this.stderrTail = [];
     this.reqSeq = 0;
     this.pending = new Map();
@@ -596,6 +605,7 @@ class PiSession {
     this.turnCtx = { replyTo: null, atUser: null };
     this.lastCtx = { replyTo: null, atUser: null };
     this.abortRequested = false;
+    this.phase = '';                 // 当前阶段: thinking / writing / tool:xxx (静默提醒用)
     this.lastEventAt = Date.now();   // 单轮看门狗用: 最近一次收到 pi 事件的时刻
     this.toolStarted = new Map();    // toolCallId -> 开始时刻 (进度提示用)
     this.lastToolNoticeAt = 0;       // 上次工具进度提示的时刻 (节流用)
@@ -716,6 +726,8 @@ class PiSession {
 
     this.stdoutBuf = Buffer.alloc(0);
     this.proc.stdout.on('data', (chunk) => this.onStdout(chunk));
+    // 与 send() 里的回调双保险: 管道写错时的 'error' 必须有监听者, 否则进程直接挂
+    this.proc.stdin.on('error', (e) => warn(`[${this.key}] pi stdin 错误: ${e.message}`));
     this.proc.stderr.on('data', (chunk) => {
       const s = chunk.toString('utf8');
       // pi 首次使用某 id 时的提示无需上报给用户
@@ -776,7 +788,11 @@ class PiSession {
     switch (rec.type) {
       case 'message_update': {
         const ev = rec.assistantMessageEvent || {};
-        if (ev.type === 'text_delta' && ev.delta) {
+        if (ev.type === 'thinking_delta') {
+          // 思考阶段没有正文可发, 但得记下「在思考」, 供静默提醒说明当前卡在哪一步
+          this.phase = 'thinking';
+        } else if (ev.type === 'text_delta' && ev.delta) {
+          this.phase = 'writing';
           this.buf += ev.delta;
           const since = Date.now() - this.lastFlush;
           if (this.buf.length >= cfg.behavior.maxChars * 0.8 || since > cfg.behavior.flushIntervalMs) {
@@ -786,9 +802,10 @@ class PiSession {
         break;
       }
       case 'tool_execution_start': {
+        // 无条件记下开始时刻: tool_execution_end 要用它算耗时
+        this.toolStarted.set(rec.toolCallId, Date.now());
+        this.phase = `tool:${rec.toolName || '工具'}`;
         if (cfg.behavior.progressOnToolCall) {
-          // 记下开始时刻, 供 tool_execution_end 算耗时
-          this.toolStarted.set(rec.toolCallId, Date.now());
           // 同一会话短时间内多次工具调用会刷屏, 用节流: 至少间隔 progressMinIntervalMs
           const now = Date.now();
           const gap = Math.max(0, Number(cfg.behavior.progressMinIntervalMs) || 3000);
@@ -802,7 +819,16 @@ class PiSession {
         break;
       }
       case 'tool_execution_end': {
+        const startedAt = this.toolStarted.get(rec.toolCallId);
         this.toolStarted.delete(rec.toolCallId);
+        this.phase = 'writing';
+        if (startedAt) {
+          const secs = Math.round((Date.now() - startedAt) / 1000);
+          // 只报慢工具: 秒级完成的报出来纯属刷屏
+          if (secs >= 5) {
+            this.sendQQ(`✅ ${rec.toolName || '工具'} 完成（耗时 ${secs}s）`, { plain: true }).catch(() => {});
+          }
+        }
         break;
       }
       case 'agent_end': {
@@ -822,6 +848,8 @@ class PiSession {
       }
       case 'agent_settled': {
         this.flush(true).catch((e) => warn(`[${this.key}] flush 失败: ${e.message}`));
+        this.silenceNotices = 0;
+        this.lastSilenceNoticeAt = 0;
         this.busy = false;
         this.abortRequested = false;
         this.lastUsed = Date.now();
@@ -853,8 +881,11 @@ class PiSession {
     // 进而触发 fatal() 把整个桥接拖死。用 String() 包一层, 代价可忽略。
     let text = String(this.buf ?? '').trim();
     this.buf = '';
-    this.lastFlush = Date.now();
+    // 空缓冲直接返回。绝不能在这里重置 lastFlush: 模型每吐一个字就会触发一次
+    // flush, 若每次都把时间戳刷新, 那么 `since > flushIntervalMs` 永远不成立,
+    // 定时器那条路就彻底废掉 —— 短回复会一直卡在缓冲里直到 agent_settled 才发出。
     if (!text) return;
+    this.lastFlush = Date.now();
     if (!force && text.length < 40) { this.buf = text; this.armFlushTimer(); return; }
     // 流式发送时先把可能未闭合的 Markdown 尾部留下, 避免 `**重点` 被切成两半
     if (!force && cfg.behavior.markdownToPlain !== false) {
@@ -919,9 +950,20 @@ class PiSession {
   }
 
   send(cmd) {
-    if (!this.proc || !this.proc.stdin.writable) return false;
-    this.proc.stdin.write(JSON.stringify(cmd) + '\n');
-    return true;
+    const p = this.proc;
+    if (!p || !p.stdin.writable) return false;
+    try {
+      // 必须带回调: stdin 写失败会 emit 无监听者的 'error' 事件,
+      // 进而变成 uncaughtException -> fatal() -> 整个桥接退出。
+      // 而这里恰恰是 pi 刚崩溃、管道已关时最容易踩到的地方。
+      p.stdin.write(`${JSON.stringify(cmd)}\n`, (err) => {
+        if (err) warn(`[${this.key}] 写入 pi stdin 失败: ${err.message}`);
+      });
+      return true;
+    } catch (e) {
+      warn(`[${this.key}] 写入 pi stdin 异常: ${e.message}`);
+      return false;
+    }
   }
 
   prompt(text, images, ctx) {
@@ -975,6 +1017,10 @@ class PiSession {
     this.busy = true;
     this.turnCtx = ctx || this.ctx || this.lastCtx;
     this.lastFlush = Date.now();
+    // 新一轮开始, 重置静默提醒计数
+    this.silenceNotices = 0;
+    this.lastSilenceNoticeAt = 0;
+    this.lastEventAt = Date.now();
     const cmd = { type: 'prompt', message };
     if (images && images.length) cmd.images = images;
     if (!this.send(cmd)) {
@@ -1098,7 +1144,15 @@ class PiSession {
     if (this.closed) return;   // 幂等: 重复调用不再二次 kill
     this.closed = true;
     if (this.flushTimer) { clearTimeout(this.flushTimer); this.flushTimer = null; }
-    this.queue = [];
+    // 排队中的消息一旦丢弃就永远没了, 必须告诉用户, 否则他以为排上了其实石沉大海。
+    // 触发场景: 闲置 30 分钟回收 / LRU 淘汰 / /reset / 关闭服务。
+    // 关闭服务时不发: 进程马上退出, 消息发不出去, 只会多一条 unhandled rejection
+    if (this.queue.length && reason !== 'shutdown') {
+      const n = this.queue.length;
+      this.queue = [];
+      this.sendQQ(`⚠️ 会话已结束（${reason}），${n} 条排队消息被丢弃，需要的话重发一下。`, { plain: true })
+        .catch((e) => warn(`[${this.key}] 丢弃队列提示发送失败: ${e.message}`));
+    }
     for (const [, p] of this.pending) {
       clearTimeout(p.timer);
       p.reject(new Error('会话已销毁'));
@@ -1180,8 +1234,14 @@ let qqAlertUndelivered = false;
 let lastSeenAt = Date.now();
 
 function alertTarget() {
+  // 优先用当前活跃会话告警; 没有会话就退回白名单第一个 QQ 号直发。
+  // 旧实现取 Map 里第一个, 遍历顺序等于插入顺序 —— 多会话时很容易发错人。
+  const active = [...sessions.values()]
+    .filter((s) => !s.closed && s.target)
+    .sort((a, b) => (b.lastUsed || 0) - (a.lastUsed || 0))[0];
+  if (active) return active.target;
   const first = [...PRIVATE_ALLOW][0];
-  return first ? Number(first) : 0;
+  return first ? { type: 'private', id: String(first) } : null;
 }
 
 async function sendAlert(text) {
@@ -1191,7 +1251,11 @@ async function sendAlert(text) {
     return false;
   }
   try {
-    await onebot.action('send_private_msg', { user_id: to, message: text }, 15000);
+    if (to.type === 'group') {
+      await onebot.action('send_group_msg', { group_id: Number(to.id), message: text }, 15000);
+    } else {
+      await onebot.action('send_private_msg', { user_id: Number(to.id), message: text }, 15000);
+    }
     return true;
   } catch (e) {
     warn(`告警发送失败: ${e.message}`);
@@ -1248,8 +1312,13 @@ const onebot = {
   selfId: null,
   echo: 0,
   pending: new Map(),
+  reconnecting: false,
 
   connect() {
+    // 重连互斥: close 可能被连续触发(例如 NapCat 反复重启), 每次都排一个 5 秒后的
+    // connect(), 会同时挂出多个 WebSocket —— 旧连接残留的 pending 永远不清理,
+    // 而且它们的 close 又会再排下一次重连, 连接数越滚越多。
+    if (this.reconnecting) { log('已有重连在进行中, 忽略本次连接请求'); return; }
     const url = cfg.napcat.url;
     const headers = cfg.napcat.token ? { Authorization: `Bearer ${cfg.napcat.token}` } : {};
     log(`连接 NapCat: ${url}`);
@@ -1284,8 +1353,17 @@ const onebot = {
 
     ws.on('close', (code) => {
       warn(`NapCat WebSocket 断开 code=${code}, 5 秒后重连`);
+      // 旧连接作废: 清掉它的 pending, 避免内存泄漏与永久挂起的 action
+      if (this.ws === ws) this.ws = null;
+      for (const [, p] of this.pending) {
+        clearTimeout(p.timer);
+        p.reject(new Error('WebSocket 已断开'));
+      }
+      this.pending.clear();
       qqOffline(`WebSocket 断开 code=${code}`);
-      setTimeout(() => this.connect(), 5000);
+      if (this.reconnecting) return;
+      this.reconnecting = true;
+      setTimeout(() => { this.reconnecting = false; this.connect(); }, 5000);
     });
     ws.on('error', (e) => warn(`NapCat WebSocket 错误: ${e.message}`));
   },
@@ -1988,30 +2066,55 @@ const THINK_ALIAS = new Set(['/thinking', '/reasoning', '/reason', '/think', '/�
 async function fetchGroupContext(groupId, selfId, triggerId) {
   const n = Math.max(0, Number(cfg.behavior.groupContextCount) || 0);
   if (!n) return '';
-  let msgs = [];
-  try {
-    const r = await onebot.action('get_group_msg_history', { group_id: Number(groupId), count: n }, 10000);
-    msgs = (r && r.data && (r.data.messages || r.data)) || [];
-  } catch (e) {
-    warn(`拉取群历史失败: ${e.message}`);
-    return '';
-  }
-  if (!Array.isArray(msgs)) return '';
-
   const maxChars = Math.max(50, Number(cfg.behavior.groupContextMaxChars) || 500);
-  const lines = [];
-  for (const m of msgs) {
-    if (String(m.user_id || '') === String(selfId)) continue;          // 自己的发言不进背景
-    if (triggerId && String(m.message_id) === String(triggerId)) continue;
-    const who = String((m.sender && (m.sender.card || m.sender.nickname)) || m.user_id || '?').replace(/\s+/g, ' ').slice(0, 20);
-    let body = '';
+
+  // 缓存已解析的条目, 不缓存拼好的文本 —— 每次调用的 triggerId 不同,
+  // 过滤必须在拼装阶段做。解析 N 条消息的代价远高于过滤, 所以缓存解析结果。
+  const ttl = Math.max(0, Number(cfg.behavior.groupContextCacheMs) || 0);
+  const ck = String(groupId);
+  let items = null;
+  if (ttl) {
+    const hit = GROUP_CTX_CACHE.get(ck);
+    if (hit && Date.now() - hit.at < ttl) items = hit.items;
+  }
+  if (!items) {
+    let msgs = [];
     try {
-      const p = parseMessage(m.raw_message, m.message);
-      body = [p.text, ...p.images.map(() => '[图片]'), ...p.files.map((f) => `[文件:${f.name}]`)].filter(Boolean).join(' ');
-    } catch { body = String(m.raw_message || ''); }
-    body = body.replace(/\s+/g, ' ').trim().slice(0, maxChars);
-    if (!body) continue;
-    lines.push(`[${who}] ${body}`);
+      const r = await onebot.action('get_group_msg_history', { group_id: Number(groupId), count: n }, 10000);
+      msgs = (r && r.data && (r.data.messages || r.data)) || [];
+    } catch (e) {
+      warn(`拉取群历史失败: ${e.message}`);
+      return '';
+    }
+    if (!Array.isArray(msgs)) return '';
+    items = [];
+    for (const m of msgs) {
+      const who = String((m.sender && (m.sender.card || m.sender.nickname)) || m.user_id || '?')
+        .replace(/\s+/g, ' ').slice(0, 20);
+      let body = '';
+      try {
+        const p = parseMessage(m.raw_message, m.message);
+        body = [p.text, ...p.images.map(() => '[图片]'), ...p.files.map((f) => `[文件:${f.name}]`)].filter(Boolean).join(' ');
+      } catch { body = String(m.raw_message || ''); }
+      body = body.replace(/\s+/g, ' ').trim().slice(0, maxChars);
+      if (!body) continue;
+      items.push({ userId: String(m.user_id || ''), messageId: String(m.message_id || ''), who, body });
+    }
+    if (ttl) {
+      GROUP_CTX_CACHE.set(ck, { at: Date.now(), items });
+      // 有界: 群数量不会多, 但长跑总得有个上限
+      if (GROUP_CTX_CACHE.size > 64) {
+        const oldest = [...GROUP_CTX_CACHE.entries()].sort((a, b) => a[1].at - b[1].at)[0];
+        if (oldest) GROUP_CTX_CACHE.delete(oldest[0]);
+      }
+    }
+  }
+
+  const lines = [];
+  for (const it of items) {
+    if (it.userId === String(selfId)) continue;          // 自己的发言不进背景
+    if (triggerId && it.messageId === String(triggerId)) continue;
+    lines.push(`[${it.who}] ${it.body}`);
   }
   if (!lines.length) return '';
   return [
@@ -2235,6 +2338,8 @@ async function describeMentions(parsed, selfId, groupId) {
 const SEEN_MSG = new Map();
 const SEEN_MSG_MAX = 2000;
 const SEEN_MSG_TTL_MS = 10 * 60 * 1000;
+// 群上下文缓存: groupId -> { at, items }
+const GROUP_CTX_CACHE = new Map();
 function isDuplicateMessage(rec) {
   const mid = rec && rec.message_id != null ? String(rec.message_id) : '';
   if (!mid) return false;
@@ -2745,7 +2850,7 @@ function fetchBinary(url, depth = 0) {
 
 // ---------------------------------------------------------------- 文件收发
 
-/** 把文件上传到 NapCat 本地缓存, 返回 file_id (NapCat 读不到宿主路径时的中转) */
+/** 把文件上传到 NapCat 本地缓存, 返回 file_id (可选, 仅 NapCat 扩展上传接口需要) */
 async function uploadFile(containerPath, name) {
   const r = await onebot.action('upload_file', {
     file: containerPath, name, folder: '', upload_file: true,
@@ -2759,7 +2864,6 @@ async function deliverFile(target, hostPath, displayName) {
   const st = fs.statSync(hostPath);
   if (st.size > MAX_FILE_BYTES) throw new Error(`超过 ${cfg.behavior.maxFileMB}MB`);
   const containerPath = toContainerPath(hostPath);
-  await uploadFile(containerPath, name);
   if (target.type === 'group') {
     await onebot.action('upload_group_file', {
       group_id: Number(target.id), file: containerPath, name,
@@ -2948,6 +3052,7 @@ let outboxTimer = null;
 let taskTimer = null;
 let heartbeatTimer = null;
 let turnTimer = null;
+let silenceTimer = null;
 let watchdogTimer = null;
 let shuttingDown = false;
 
@@ -3038,6 +3143,35 @@ function start() {
     turnTimer.unref();
   }
 
+  // 静默提醒: 长思考 / 长命令执行期间桥接无任何 text_delta 可发, 用户会以为卡死了。
+  // 与单轮看门狗互补: 那个是「打断」, 这个是「先告诉用户我还活着」。
+  const SILENCE_MS = Math.max(0, Number(cfg.behavior.silenceNoticeMs) || 0);
+  const SILENCE_MAX = Math.max(1, Number(cfg.behavior.silenceNoticeMax) || 5);
+  if (SILENCE_MS) {
+    silenceTimer = setInterval(() => {
+      const now = Date.now();
+      for (const [k, s] of sessions) {
+        if (!s.busy || s.closed) continue;
+        const idle = now - (s.lastEventAt || now);
+        if (idle < SILENCE_MS) continue;
+        const sent = s.silenceNotices || 0;
+        if (sent >= SILENCE_MAX) continue;
+        if (now - (s.lastSilenceNoticeAt || 0) < SILENCE_MS) continue;
+        s.silenceNotices = sent + 1;
+        s.lastSilenceNoticeAt = now;
+        const secs = Math.round(idle / 1000);
+        // 说清楚卡在哪一步, 比单纯报个秒数有用得多
+        const where = s.phase === 'thinking' ? '模型正在思考'
+          : (s.phase && s.phase.startsWith('tool:') ? `正在跑 ${s.phase.slice(5)}`
+            : (s.phase === 'writing' ? '正在生成回复' : '没有新进展'));
+        const tip = sent === 0 ? `（当前：${where}）` : '';
+        s.sendQQ(`⏳ 还在跑，已经 ${secs} 秒没有新输出了${tip}。要停就发 /stop。`, { plain: true })
+          .catch((e) => warn(`[${k}] 静默提醒发送失败: ${e.message}`));
+      }
+    }, Math.max(5000, Math.min(30000, Math.floor(SILENCE_MS / 2))));
+    silenceTimer.unref();
+  }
+
   log(`pi-qq 桥接启动: napcat=${cfg.napcat.url} maxSessions=${cfg.behavior.maxSessions}`);
   if (!PRIVATE_ALLOW.size && !cfg.access.allowAllPrivate) {
     warn('⚠️ 私聊白名单为空且 allowAllPrivate=false —— 私聊消息会被全部忽略。');
@@ -3059,6 +3193,7 @@ async function shutdown(reason) {
   if (taskTimer) clearInterval(taskTimer);
   if (heartbeatTimer) clearInterval(heartbeatTimer);
   if (turnTimer) clearInterval(turnTimer);
+  if (silenceTimer) clearInterval(silenceTimer);
   if (watchdogTimer) clearInterval(watchdogTimer);
   for (const [, s] of sessions) await s.destroy('shutdown');
   process.exit(0);

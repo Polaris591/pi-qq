@@ -33,10 +33,13 @@
   },
   "behavior": {
     "maxSessions": 5,
-    "idleTimeoutMs": 1800000,
+    "idleTimeoutMs": 7200000,
     "maxChars": 2500,
     "flushIntervalMs": 6000,
-    "progressOnToolCall": false,
+    "progressOnToolCall": true,
+    "progressMinIntervalMs": 3000,
+    "silenceNoticeMs": 60000,
+    "silenceNoticeMax": 5,
     "startupNotice": true,
     "groupReplyMode": "quote+at",
     "emojiReaction": 10084,
@@ -48,10 +51,13 @@
     "maxQueue": 5,
     "groupContextCount": 60,
     "groupContextMaxChars": 500,
+    "groupContextCacheMs": 30000,
     "heartbeatTimeoutMs": 90000,
     "turnTimeoutMs": 2700000,
     "selfHealMs": 120000,
-    "progressMinIntervalMs": 3000
+    "taskTickMs": 20000,
+    "missedWindowMs": 1800000,
+    "markdownToPlain": true
   },
   "persona": {
     "text": "",
