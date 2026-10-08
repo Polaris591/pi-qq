@@ -1338,6 +1338,8 @@ class PiSession {
 }
 
 const sessions = new Map();
+// 正在创建中的会话 (key -> Promise): 合并并发创建请求, 避免同一个会话被建两次
+const creatingSessions = new Map();
 
 /** 直接给某个 target 发一条纯文本 (不经过会话, 用于告警/通知) */
 async function notifyTarget(target, text) {
@@ -1363,20 +1365,39 @@ async function getSession(target) {
   const key = sessionKey(target);
   let s = sessions.get(key);
   if (s && !s.closed) return s;
-  if (sessions.size >= cfg.behavior.maxSessions) {
-    // LRU 淘汰: 优先闲置会话; 全部忙碌时也淘汰最久未用的一个, 否则会话数会无限增长
-    let oldest = null;
-    for (const [, v] of sessions) {
-      if (!oldest) { oldest = v; continue; }
-      const better = (oldest.busy && !v.busy)
-        || (oldest.busy === v.busy && v.lastUsed < oldest.lastUsed);
-      if (better) oldest = v;
+
+  // 并发保护: handleIncoming 是并发跑的(每条消息各自一个 promise), 同一个 key 的
+  // 两条消息可能同时走到这里。而下面 LRU 淘汰那步有 await —— 期间两个调用都会
+  // 认为「还没有实例」, 各自 new 一个, 后一个 sessions.set 覆盖前一个, 前一个
+  // pi 子进程就成了没人管的孤儿, 会一直在后台跑着。
+  // 用一张「正在创建」表把并发的调用合并到同一个 promise 上。
+  const inflight = creatingSessions.get(key);
+  if (inflight) return inflight;
+
+  const p = (async () => {
+    try {
+      const cur = sessions.get(key);
+      if (cur && !cur.closed) return cur;
+      if (sessions.size >= cfg.behavior.maxSessions) {
+        // LRU 淘汰: 优先闲置会话; 全部忙碌时也淘汰最久未用的一个, 否则会话数会无限增长
+        let oldest = null;
+        for (const [, v] of sessions) {
+          if (!oldest) { oldest = v; continue; }
+          const better = (oldest.busy && !v.busy)
+            || (oldest.busy === v.busy && v.lastUsed < oldest.lastUsed);
+          if (better) oldest = v;
+        }
+        if (oldest) { sessions.delete(oldest.key); await oldest.destroy('LRU'); }
+      }
+      const ns = new PiSession(key, target);
+      sessions.set(key, ns);
+      return ns;
+    } finally {
+      creatingSessions.delete(key);
     }
-    if (oldest) { sessions.delete(oldest.key); await oldest.destroy('LRU'); }
-  }
-  s = new PiSession(key, target);
-  sessions.set(key, s);
-  return s;
+  })();
+  creatingSessions.set(key, p);
+  return p;
 }
 
 setInterval(() => {
@@ -2664,9 +2685,13 @@ async function handleIncoming(rec) {
   if (parsed.files.length) {
     const notes = [];
     const parts = [];
-    for (const f of parsed.files.slice(0, Math.max(1, Number(cfg.behavior.maxInboundFiles) || 3))) {
+    const inbound = parsed.files.slice(0, Math.max(1, Number(cfg.behavior.maxInboundFiles) || 3));
+    for (let fi = 0; fi < inbound.length; fi++) {
+      const f = inbound[fi];
       const safe = String(f.name || 'file').replace(/[\\/:*?"<>|]/g, '_').slice(0, 80) || 'file';
-      const dest = path.join(INBOX_DIR, `${key}_${Date.now()}_${safe}`);
+      // 带上序号: 同一条消息里两个同名文件若只靠时间戳, 同一毫秒内会落到同一个
+      // 路径互相覆盖 —— 文本类内容当场就读了没事, 二进制文件模型会读到错的那个。
+      const dest = path.join(INBOX_DIR, `${key}_${Date.now()}_${fi}_${safe}`);
       try {
         const url = await resolveInboundUrl(f, isGroup, isGroup ? groupId : userId);
         if (!url) throw new Error('拿不到下载地址');
@@ -3591,6 +3616,6 @@ if (require.main === module) {
 } else {
   module.exports = {
     start, fatal, onebot, sessions,
-    requestRestart, maybeRestartNow, busySessionCount, setExitHook, restartState,
+    requestRestart, maybeRestartNow, busySessionCount, setExitHook, restartState, getSession,
   };
 }

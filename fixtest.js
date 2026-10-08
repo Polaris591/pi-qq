@@ -30,7 +30,7 @@ fs.writeFileSync(path.join(BASE, 'config.json'), JSON.stringify({
 
 const src = fs.readFileSync(path.join(__dirname, 'bridge.js'), 'utf8');
 fs.writeFileSync(path.join(BASE, 'bridge.js'), `${src}
-module.exports = { PiSession, sessions, alertTarget, cfg, onebot, fetchGroupContext, GROUP_CTX_CACHE, sweepStorage, STATE, dispatchCommand, HELP, requestRestart, maybeRestartNow, busySessionCount, setExitHook, restartState, mdToPlain };
+module.exports = { PiSession, sessions, alertTarget, cfg, onebot, fetchGroupContext, GROUP_CTX_CACHE, sweepStorage, STATE, dispatchCommand, HELP, requestRestart, maybeRestartNow, busySessionCount, setExitHook, restartState, mdToPlain, getSession, creatingSessions };
 `);
 
 const results = [];
@@ -754,6 +754,31 @@ const ok = (name, pass, extra) => { results.push({ name, pass }); console.log(`$
 
     B.cfg.behavior.quietNotices = false;
     a.closed = true; b.closed = true; c.closed = true;
+  }
+
+  // ---- 修复 25: 并发 getSession 不能把同一个会话建两次
+  {
+    const savedMax = B.cfg.behavior.maxSessions;
+    B.cfg.behavior.maxSessions = 1;
+    B.sessions.clear();
+    B.creatingSessions.clear();
+    // 先放一个别的会话, 让 LRU 分支被走到 —— 那里有 await, 是竞态的入口
+    const other = new B.PiSession('private_78', { type: 'private', id: '78' });
+    other.proc = { stdin: { writable: true, write: (d, cb) => { if (cb) cb(null); }, on: () => {} } };
+    B.sessions.set('private_78', other);
+
+    const target = { type: 'private', id: '77' };
+    const [a, b, c] = await Promise.all([
+      B.getSession(target), B.getSession(target), B.getSession(target),
+    ]);
+    ok('并发 getSession 返回同一个实例', a === b && b === c, `same=${a === b && b === c}`);
+    ok('注册表里就是那个实例', B.sessions.get('private_77') === a);
+    ok('创建表已清空', B.creatingSessions.size === 0, `n=${B.creatingSessions.size}`);
+    ok('没有产生多余实例', [...B.sessions.values()].filter((x) => x.key === 'private_77').length === 1);
+
+    B.sessions.clear();
+    B.creatingSessions.clear();
+    B.cfg.behavior.maxSessions = savedMax;
   }
 
   console.log('\n===== 结果 =====');
