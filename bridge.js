@@ -596,6 +596,13 @@ class PiSession {
     // 静默提醒用: 本轮已提醒次数与上次提醒时刻
     this.silenceNotices = 0;
     this.lastSilenceNoticeAt = 0;
+    // 静默提醒必须看「多久没给用户发过东西」, 而不是「多久没收到 pi 事件」。
+    // pi 在思考期间会持续发 thinking_delta、长命令期间会发 tool_execution_update
+    // 心跳 —— 这些事件会把「收到事件」的时间一直刷新, 但用户那边一个字都看不到。
+    this.lastOutputAt = Date.now();
+    // 非 prompt 的长操作(压缩上下文 / 切换会话等)也要被静默提醒覆盖
+    this.workLabel = '';
+    this.workSince = 0;
     this.stderrTail = [];
     this.reqSeq = 0;
     this.pending = new Map();
@@ -914,6 +921,8 @@ class PiSession {
     let body = text;
     if (cfg.behavior.markdownToPlain !== false && !opts.raw) body = mdToPlain(body);
     if (!body) return;
+    // 记下「刚给用户发过东西」, 供静默提醒计时
+    this.lastOutputAt = Date.now();
     const o = { ...(opts.ctx || this.ctx || this.lastCtx), ...opts };
     if (this.target.type !== 'group') {
       return onebot.action('send_private_msg', { user_id: Number(this.target.id), message: body });
@@ -949,6 +958,24 @@ class PiSession {
   /** 把图片以图片段发出 */
   async sendImage(hostPath) {
     return deliverImage(this.target, hostPath, this.ctx || this.lastCtx);
+  }
+
+  /**
+   * 标记一个「不算 busy 但同样耗时的操作」, 让静默提醒能覆盖到。
+   * 例如 /compact 可能跑三分钟、/new 与 /resume 要重新握手 pi ——
+   * 这些路径不走 prompt, 所以 busy 一直是 false, 原先的看门狗完全看不见。
+   */
+  beginWork(label) {
+    this.workLabel = String(label || '处理中');
+    this.workSince = Date.now();
+    this.lastOutputAt = Date.now();
+    this.silenceNotices = 0;
+    this.lastSilenceNoticeAt = 0;
+  }
+
+  endWork() {
+    this.workLabel = '';
+    this.workSince = 0;
   }
 
   send(cmd) {
@@ -1023,6 +1050,8 @@ class PiSession {
     this.silenceNotices = 0;
     this.lastSilenceNoticeAt = 0;
     this.lastEventAt = Date.now();
+    this.lastOutputAt = Date.now();
+    this.workLabel = '';
     const cmd = { type: 'prompt', message };
     if (images && images.length) cmd.images = images;
     if (!this.send(cmd)) {
@@ -2458,6 +2487,7 @@ async function handleIncoming(rec) {
   if (cmd === '/new') {
     if (session.busy) { await session.sendQQ('⏳ 当前任务执行中，请先 /stop。'); return; }
     try {
+      session.beginWork('开启新会话');
       const file = await session.newSession();
       const d = await session.describeModel();
       await session.sendQQ([
@@ -2467,6 +2497,7 @@ async function handleIncoming(rec) {
         file ? `文件: ${path.basename(file)}` : '',
       ].filter(Boolean).join('\n'));
     } catch (e) { await session.sendQQ(`❌ 开启新会话失败: ${e.message}`); }
+    finally { session.endWork(); }
     return;
   }
 
@@ -2488,6 +2519,7 @@ async function handleIncoming(rec) {
     const idx = pickIndex(arg, session.lastResumeList.length);
     if (idx === null) { await session.sendQQ(`⚠️ 序号需在 1-${session.lastResumeList.length} 之间。`); return; }
     try {
+      session.beginWork('恢复会话');
       const file = await session.switchTo(session.lastResumeList[idx]);
       const d = await session.describeModel();
       await session.sendQQ([
@@ -2497,6 +2529,7 @@ async function handleIncoming(rec) {
         `思考: ${d.thinkingLevel || '-'}`,
       ].join('\n'));
     } catch (e) { await session.sendQQ(`❌ 恢复会话失败: ${e.message}`); }
+    finally { session.endWork(); }
     return;
   }
 
@@ -2595,7 +2628,8 @@ async function handleIncoming(rec) {
       await session.sendQQ('🗜️ 正在压缩上下文，请稍候…', { plain: true });
       const payload = { type: 'compact' };
       if (arg) payload.customInstructions = arg;
-      const r = await session.request(payload, 180000);
+      session.beginWork('压缩上下文');
+      const r = await session.request(payload, 180000).finally(() => session.endWork());
       const before = r && r.tokensBefore;
       const after = r && r.estimatedTokensAfter;
       const fmt = (n) => (n == null ? '-' : Number(n).toLocaleString('en-US'));
@@ -3153,24 +3187,28 @@ function start() {
     silenceTimer = setInterval(() => {
       const now = Date.now();
       for (const [k, s] of sessions) {
-        if (!s.busy || s.closed) continue;
-        const idle = now - (s.lastEventAt || now);
+        if (s.closed) continue;
+        // busy = 正在跑一轮 prompt; workLabel = 正在跑一个耗时的非 prompt 操作
+        if (!s.busy && !s.workLabel) continue;
+        const idle = now - (s.lastOutputAt || s.lastEventAt || now);
         if (idle < SILENCE_MS) continue;
         const sent = s.silenceNotices || 0;
         if (sent >= SILENCE_MAX) continue;
-        if (now - (s.lastSilenceNoticeAt || 0) < SILENCE_MS) continue;
+        // 提醒间隔逐次拉长 (45s/90s/135s…), 否则长任务会被同一条消息刷屏
+        const need = SILENCE_MS * (sent + 1);
+        if (now - (s.lastSilenceNoticeAt || 0) < need) continue;
         s.silenceNotices = sent + 1;
         s.lastSilenceNoticeAt = now;
         const secs = Math.round(idle / 1000);
         // 说清楚卡在哪一步, 比单纯报个秒数有用得多
-        const where = s.phase === 'thinking' ? '模型正在思考'
+        const where = s.workLabel || (s.phase === 'thinking' ? '模型正在思考'
           : (s.phase && s.phase.startsWith('tool:') ? `正在跑 ${s.phase.slice(5)}`
-            : (s.phase === 'writing' ? '正在生成回复' : '没有新进展'));
+            : (s.phase === 'writing' ? '正在生成回复' : '没有新进展')));
         const tip = sent === 0 ? `（当前：${where}）` : '';
         s.sendQQ(`⏳ 还在跑，已经 ${secs} 秒没有新输出了${tip}。要停就发 /stop。`, { plain: true })
           .catch((e) => warn(`[${k}] 静默提醒发送失败: ${e.message}`));
       }
-    }, Math.max(5000, Math.min(30000, Math.floor(SILENCE_MS / 2))));
+    }, Math.max(5000, Math.min(15000, Math.floor(SILENCE_MS / 3))));
     silenceTimer.unref();
   }
 

@@ -168,6 +168,34 @@ const ok = (name, pass, extra) => { results.push({ name, pass }); console.log(`$
     ob.reconnecting = false;
   }
 
+  // ---- 修复 7: 静默提醒按「多久没给用户发过话」计时, 而不是「多久没收到 pi 事件」
+  {
+    const s = new B.PiSession('private_9', { type: 'private', id: '9' });
+    s.proc = { stdin: { writable: true, write: (d, cb) => { if (cb) cb(null); }, on: () => {} } };
+    // 模拟: pi 一直在发 thinking_delta, lastEventAt 被不断刷新, 但用户看不到任何东西
+    s.lastEventAt = Date.now();
+    s.lastOutputAt = Date.now() - 120000;   // 已经 2 分钟没给用户发过话
+    s.busy = true;
+    const SILENCE_MS = 45000;
+    const idleByEvent = Date.now() - s.lastEventAt;   // 旧算法: 很小, 不会提醒
+    const idleByOutput = Date.now() - s.lastOutputAt; // 新算法: 120s, 会提醒
+    ok('旧算法(按事件)会漏掉思考期的静默', idleByEvent < SILENCE_MS, `idleByEvent=${Math.round(idleByEvent / 1000)}s`);
+    ok('新算法(按输出)能认出静默', idleByOutput >= SILENCE_MS, `idleByOutput=${Math.round(idleByOutput / 1000)}s`);
+
+    // sendQQ 应该刷新 lastOutputAt
+    const before = s.lastOutputAt;
+    s.sendQQ('测试消息').catch(() => {});
+    ok('sendQQ 会刷新 lastOutputAt', s.lastOutputAt > before);
+
+    // beginWork / endWork
+    s.busy = false;
+    s.beginWork('压缩上下文');
+    ok('beginWork 后即使不 busy 也算在工作', !s.busy && !!s.workLabel, `workLabel=${s.workLabel}`);
+    s.endWork();
+    ok('endWork 清除工作标记', !s.workLabel);
+    s.closed = true;
+  }
+
   console.log('\n===== 结果 =====');
   const bad = results.filter((r) => !r.pass);
   console.log(`通过 ${results.length - bad.length}/${results.length}`);
