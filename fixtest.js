@@ -441,14 +441,15 @@ const ok = (name, pass, extra) => { results.push({ name, pass }); console.log(`$
     s.sendQQ = async (t) => { sent.push(String(t)); return { status: 'ok' }; };
     s.proc = { stdin: { writable: true, write: (d, cb) => { if (cb) cb(null); }, on: () => {} } };
 
-    // 场景 A1: 第一次空回复 => 自动重试
+    // 场景 A1: 第一次空回复 => 自动重试 (只写日志, 不打扰用户)
     s.prompt('测试', [], { replyTo: null, atUser: null });
     s.buf = '';
     s.onRecord({ type: 'agent_settled' });
-    await new Promise((r) => setTimeout(r, 80));
-    ok('首次空回复会自动重试', sent.some((t) => t.includes('自动重试')),
+    ok('首次空回复会排上重试', (s.emptyRetries || 0) === 1, `n=${s.emptyRetries}`);
+    await new Promise((r) => setTimeout(r, 700));   // 重试是 500ms 后触发
+    ok('重试确实重新发了 prompt', s.busy === true, `busy=${s.busy}`);
+    ok('重试时不打扰用户', !sent.some((t) => t.includes('自动重试') || t.includes('连续两次')),
       JSON.stringify(sent).slice(0, 120));
-    ok('自动重试时不会误报「连续两次」', !sent.some((t) => t.includes('连续两次')));
 
     // 场景 A2: 再空一次 => 退化为明确提示, 不再重试
     sent.length = 0;
@@ -525,6 +526,46 @@ const ok = (name, pass, extra) => { results.push({ name, pass }); console.log(`$
     ok('删掉过期的 .sent 归档', !fsx.existsSync(fOld));
     ok('保留未过期的 .sent 归档', fsx.existsSync(fNew));
     try { fsx.unlinkSync(fNew); } catch {}
+  }
+
+  // ---- 修复 18: 思考退化循环的防线
+  {
+    const s = new B.PiSession('private_80', { type: 'private', id: '80' });
+    const sent = [];
+    const aborts = [];
+    s.sendQQ = async (t) => { sent.push(String(t)); return { status: 'ok' }; };
+    s.send = (cmd) => { aborts.push(cmd.type); return true; };
+    s.proc = { stdin: { writable: true, write: (d, cb) => { if (cb) cb(null); }, on: () => {} } };
+    B.cfg.behavior.thinkingGuardChars = 1000;
+
+    s.prompt('测试', [], { replyTo: null, atUser: null });
+    // 灌入超长思考 (模拟 </parameter></invoke> 无限重复)
+    for (let i = 0; i < 30; i++) {
+      s.onRecord({ type: 'message_update', assistantMessageEvent: { type: 'thinking_delta', delta: 'x'.repeat(100) } });
+    }
+    ok('思考超限会主动中断', aborts.includes('abort'), `aborts=${JSON.stringify(aborts)}`);
+    ok('思考超限会提示用户', sent.some((t) => t.includes('重复循环')), JSON.stringify(sent).slice(0, 120));
+    ok('中断只触发一次', aborts.filter((x) => x === 'abort').length === 1,
+      `count=${aborts.filter((x) => x === 'abort').length}`);
+
+    // 正常长度的思考不该触发
+    const s2 = new B.PiSession('private_81', { type: 'private', id: '81' });
+    const aborts2 = [];
+    s2.send = (cmd) => { aborts2.push(cmd.type); return true; };
+    s2.sendQQ = async () => ({ status: 'ok' });
+    s2.proc = { stdin: { writable: true, write: (d, cb) => { if (cb) cb(null); }, on: () => {} } };
+    s2.prompt('测试', [], { replyTo: null, atUser: null });
+    for (let i = 0; i < 5; i++) {
+      s2.onRecord({ type: 'message_update', assistantMessageEvent: { type: 'thinking_delta', delta: 'x'.repeat(100) } });
+    }
+    ok('正常思考不触发中断', !aborts2.includes('abort'), `aborts=${JSON.stringify(aborts2)}`);
+
+    // 新一轮要重置计数
+    s.thinkChars = 0; s.thinkGuardFired = false;
+    s.prompt('第二轮', [], { replyTo: null, atUser: null });
+    ok('新一轮重置思考计数', s.thinkChars === 0 && s.thinkGuardFired === false);
+    B.cfg.behavior.thinkingGuardChars = 80000;
+    s.closed = true; s2.closed = true;
   }
 
   console.log('\n===== 结果 =====');

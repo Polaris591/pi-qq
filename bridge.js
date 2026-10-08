@@ -632,6 +632,8 @@ class PiSession {
     this.toolStarted = new Map();    // toolCallId -> 开始时刻 (进度提示用)
     this.lastToolNoticeAt = 0;       // 上次工具进度提示的时刻 (节流用)
     this.turnHadOutput = false;      // 本轮是否真的给用户发过东西 (空回复检测)
+    this.thinkChars = 0;             // 本轮思考累计字符数
+    this.thinkGuardFired = false;    // 本轮是否已因思考过长中断过
     this.emptyRetries = 0;           // 连续空回复次数 (最多自动重试 1 次)
     this.lastPrompt = null;          // 空回复时原样重试用
     this.spawnedAt = 0;              // 本次 pi 子进程的启动时刻 (退避判断用)
@@ -860,6 +862,20 @@ class PiSession {
         if (ev.type === 'thinking_delta') {
           // 思考阶段没有正文可发, 但得记下「在思考」, 供静默提醒说明当前卡在哪一步
           this.phase = 'thinking';
+          this.thinkChars = (this.thinkChars || 0) + String(ev.delta || '').length;
+          // 退化循环防线: 上游偶发把工具调用吐成 DSML 文本, 模型解析不了就会
+          // 无限重复 </parameter></invoke> 直到撞满输出上限。实测出现过两条
+          // 各 42 万字符(12.8 万 token)的思考块, 永久占掉 34% 上下文。
+          // 超过阈值就主动掐断, 别再往历史里灌垃圾。
+          const limit = Math.max(0, Number(cfg.behavior.thinkingGuardChars) || 0);
+          if (limit && this.thinkChars > limit && !this.thinkGuardFired) {
+            this.thinkGuardFired = true;
+            warn(`[${this.key}] 思考长度异常 (${this.thinkChars} 字符), 判定退化循环, 主动中断`);
+            this.abortRequested = true;
+            this.send({ type: 'abort', id: `abort-think-${Date.now()}` });
+            this.sendQQ('⚠️ 模型陷入重复循环（上游工具调用格式异常），我把它中断了。重发一次通常就好。',
+              { plain: true }).catch(() => {});
+          }
         } else if (ev.type === 'text_delta' && ev.delta) {
           this.phase = 'writing';
           this.buf += ev.delta;
@@ -936,7 +952,9 @@ class PiSession {
             // 实测换个时间重发同样的请求就能成功, 所以先自动重试一次,
             // 比让用户自己再发一遍体验好得多。
             this.emptyRetries = retries + 1;
-            this.sendQQ('⚠️ 上游返回了空回复，我自动重试一次…', { plain: true }).catch(() => {});
+            // 重试成功时用户不需要知道这件事, 群里更不该出现这种技术黑话。
+            // 只在重试也失败时才出声。
+            log(`[${this.key}] 空回复, 自动重试一次`);
             setTimeout(() => {
               if (this.closed) return;
               const lp = this.lastPrompt;
@@ -1141,6 +1159,8 @@ class PiSession {
     }
     this.busy = true;
     this.turnHadOutput = false;   // 本轮是否真的给用户发过东西
+    this.thinkChars = 0;          // 本轮思考累计长度 (退化循环检测)
+    this.thinkGuardFired = false;
     // 存「注入记忆前缀之前」的原文与 ctx: prompt() 会再注入一次前缀,
     // 若存 message(已含前缀)会导致重试时前缀出现两遍。
     this.lastPrompt = { text, images, ctx };

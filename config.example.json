@@ -63,7 +63,8 @@
     "storageSweepMs": 21600000,
     "spawnQuickExitMs": 10000,
     "spawnMaxBackoffMs": 300000,
-    "outboxSentRetentionDays": 30
+    "outboxSentRetentionDays": 30,
+    "thinkingGuardChars": 80000
   },
   "persona": {
     "text": "",
