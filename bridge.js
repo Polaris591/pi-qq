@@ -630,6 +630,9 @@ class PiSession {
     this.lastEventAt = Date.now();   // 单轮看门狗用: 最近一次收到 pi 事件的时刻
     this.toolStarted = new Map();    // toolCallId -> 开始时刻 (进度提示用)
     this.lastToolNoticeAt = 0;       // 上次工具进度提示的时刻 (节流用)
+    this.turnHadOutput = false;      // 本轮是否真的给用户发过东西 (空回复检测)
+    this.emptyRetries = 0;           // 连续空回复次数 (最多自动重试 1 次)
+    this.lastPrompt = null;          // 空回复时原样重试用
     this.spawnedAt = 0;              // 本次 pi 子进程的启动时刻 (退避判断用)
     this.spawnFailures = 0;          // 连续快速失败次数
     this.respawnTimer = null;
@@ -916,6 +919,31 @@ class PiSession {
         this.lastSilenceNoticeAt = 0;
         this.busy = false;
         debug(`[${this.key}] busy=false (agent_settled)`);
+        // 空回复兜底: 模型偶尔会只输出思考、不给正文就结束(stopReason=stop)。
+        // 桥接没东西可发, 用户那边就是彻底的静默 —— 看起来像卡死, 实际是这一轮
+        // 什么都没有。必须主动说一声, 否则用户只能靠再发一条来探活。
+        if (!this.turnHadOutput && !this.abortRequested) {
+          warn(`[${this.key}] 本轮没有产生任何正文输出`);
+          const retries = this.emptyRetries || 0;
+          if (retries < 1 && this.lastPrompt) {
+            // 上游偶发把工具调用塞进思考通道, 导致正文与 tool_calls 全空。
+            // 实测换个时间重发同样的请求就能成功, 所以先自动重试一次,
+            // 比让用户自己再发一遍体验好得多。
+            this.emptyRetries = retries + 1;
+            this.sendQQ('⚠️ 上游返回了空回复，我自动重试一次…', { plain: true }).catch(() => {});
+            setTimeout(() => {
+              if (this.closed) return;
+              this.prompt(this.lastPrompt.message, this.lastPrompt.images, this.turnCtx);
+            }, 500);
+          } else {
+            this.emptyRetries = 0;
+            this.sendQQ('⚠️ 连续两次都是空回复（上游没返回正文）。'
+              + '可以再试一次，或者用 /compact 压缩上下文、/new 开新会话、/model 换个模型。',
+              { plain: true }).catch(() => {});
+          }
+        } else if (this.turnHadOutput) {
+          this.emptyRetries = 0;   // 正常出话就清零
+        }
         this.abortRequested = false;
         this.lastUsed = Date.now();
         this.stderrTail = [];
@@ -958,6 +986,7 @@ class PiSession {
       if (hold) { text = safe; this.buf = hold; }
       if (!text) { this.armFlushTimer(); return; }
     }
+    this.turnHadOutput = true;
     const c = ctx || this.turnCtx || this.ctx || this.lastCtx;
     const parts = splitForQQ(text, cfg.behavior.maxChars);
     for (let i = 0; i < parts.length; i++) {
@@ -1104,6 +1133,8 @@ class PiSession {
       return;
     }
     this.busy = true;
+    this.turnHadOutput = false;   // 本轮是否真的给用户发过东西
+    this.lastPrompt = { message, images };   // 空回复时用来原样重试
     debug(`[${this.key}] busy=true (prompt)`);
     this.turnCtx = ctx || this.ctx || this.lastCtx;
     this.lastFlush = Date.now();

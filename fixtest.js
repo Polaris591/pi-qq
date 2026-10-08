@@ -434,6 +434,61 @@ const ok = (name, pass, extra) => { results.push({ name, pass }); console.log(`$
     s.closed = true;
   }
 
+  // ---- 修复 15: 空回复兜底 (模型只输出思考就结束, 用户那边彻底静默)
+  {
+    const s = new B.PiSession('private_60', { type: 'private', id: '60' });
+    const sent = [];
+    s.sendQQ = async (t) => { sent.push(String(t)); return { status: 'ok' }; };
+    s.proc = { stdin: { writable: true, write: (d, cb) => { if (cb) cb(null); }, on: () => {} } };
+
+    // 场景 A1: 第一次空回复 => 自动重试
+    s.prompt('测试', [], { replyTo: null, atUser: null });
+    s.buf = '';
+    s.onRecord({ type: 'agent_settled' });
+    await new Promise((r) => setTimeout(r, 80));
+    ok('首次空回复会自动重试', sent.some((t) => t.includes('自动重试')),
+      JSON.stringify(sent).slice(0, 120));
+    ok('自动重试时不会误报「连续两次」', !sent.some((t) => t.includes('连续两次')));
+
+    // 场景 A2: 再空一次 => 退化为明确提示, 不再重试
+    sent.length = 0;
+    s.buf = '';
+    s.onRecord({ type: 'agent_settled' });
+    await new Promise((r) => setTimeout(r, 80));
+    ok('连续两次空回复给出明确提示',
+      sent.some((t) => t.includes('连续两次都是空回复')), JSON.stringify(sent).slice(0, 140));
+
+    // 场景 A3: 恢复正常后计数清零
+    sent.length = 0;
+    s.prompt('测试', [], { replyTo: null, atUser: null });
+    s.buf = '一段正常输出，长度足够通过最小长度检查。'.repeat(2);
+    await s.flush(true);
+    s.onRecord({ type: 'agent_settled' });
+    await new Promise((r) => setTimeout(r, 40));
+    ok('正常输出后空回复计数清零', (s.emptyRetries || 0) === 0, `n=${s.emptyRetries}`);
+
+    // 场景 B: 本轮有输出 => 不该提示
+    sent.length = 0;
+    s.prompt('测试', [], { replyTo: null, atUser: null });
+    s.buf = '正常的一段回答内容，足够长以便通过最小长度检查。'.repeat(2);
+    await s.flush(true);
+    s.onRecord({ type: 'agent_settled' });
+    await new Promise((r) => setTimeout(r, 40));
+    ok('有输出时不提示空回复', !sent.some((t) => t.includes('没有输出任何内容')),
+      JSON.stringify(sent).slice(0, 120));
+
+    // 场景 C: 用户主动 /stop 导致的空 => 不该再提示 (本来就说了要停)
+    sent.length = 0;
+    s.prompt('测试', [], { replyTo: null, atUser: null });
+    s.abortRequested = true;
+    s.buf = '';
+    s.onRecord({ type: 'agent_settled' });
+    await new Promise((r) => setTimeout(r, 40));
+    ok('/stop 后不提示空回复', !sent.some((t) => t.includes('没有输出任何内容')),
+      JSON.stringify(sent).slice(0, 120));
+    s.closed = true;
+  }
+
   console.log('\n===== 结果 =====');
   const bad = results.filter((r) => !r.pass);
   console.log(`通过 ${results.length - bad.length}/${results.length}`);
