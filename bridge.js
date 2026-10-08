@@ -2163,7 +2163,10 @@ function normalizeTask(raw, source) {
   const schedule = normalizeSchedule(raw.schedule);
   if (!schedule) return null;
   const prompt = String(raw.prompt || '').trim();
-  if (!prompt) return null;
+  const exec = String(raw.exec || '').trim();
+  // prompt / exec 二选一。exec 走脚本: 有输出才发, 没输出就完全不出声 ——
+  // 体检这类「没事就别吭声」的任务不能交给模型去判断要不要说话。
+  if (!prompt && !exec) return null;
   const target = { type: m[1], id: m[2] };
   if (!taskTargetAllowed(target)) {
     warn(`任务目标不在白名单, 已忽略: ${targetStr} (${source || '?'})`);
@@ -2172,7 +2175,7 @@ function normalizeTask(raw, source) {
   const id = String(raw.id || `${targetStr}-${Math.random().toString(36).slice(2, 8)}`)
     .replace(/[^A-Za-z0-9_.-]/g, '_').slice(0, 64);
   return {
-    id, target, schedule, prompt,
+    id, target, schedule, prompt, exec,
     name: raw.name ? String(raw.name).slice(0, 60) : '',
     enabled: raw.enabled === false ? false : true,
     createdAt: Number(raw.createdAt) || Date.now(),
@@ -2238,12 +2241,54 @@ function fmtClock(ms) {
   return `${d.getMonth() + 1}-${pad2(d.getDate())} ${pad2(d.getHours())}:${pad2(d.getMinutes())}`;
 }
 
+/** 跑一条 shell 命令, 返回 { code, out, err }。超时直接杀掉。 */
+function runShell(cmd, timeoutMs) {
+  return new Promise((resolve) => {
+    let out = '';
+    let err = '';
+    let done = false;
+    const finish = (r) => { if (!done) { done = true; resolve(r); } };
+    let child;
+    try {
+      child = spawn('/bin/bash', ['-lc', cmd], { cwd: cfg.pi.cwd, env: process.env });
+    } catch (e) { finish({ code: -1, out: '', err: String(e.message || e) }); return; }
+    const timer = setTimeout(() => {
+      try { child.kill('SIGKILL'); } catch { /* 已经退了 */ }
+      finish({ code: -1, out, err: `${err}\n(超时 ${Math.round(timeoutMs / 1000)}s, 已杀掉)` });
+    }, timeoutMs);
+    timer.unref?.();
+    child.stdout?.on('data', (d) => { out += d; });
+    child.stderr?.on('data', (d) => { err += d; });
+    child.on('error', (e) => { clearTimeout(timer); finish({ code: -1, out, err: String(e.message || e) }); });
+    child.on('close', (code) => { clearTimeout(timer); finish({ code, out, err }); });
+  });
+}
+
 /** 对目标会话跑一次 pi, 把结果发到 QQ (任务模式下 pi 处于全新会话) */
 async function runTask(t) {
   const target = t.target;
   const key = sessionKey(target);
   const label = t.name || t.id;
   log(`执行定时任务: ${t.id} -> ${key}`);
+
+  // 脚本型任务: 不经过模型, 输出为空就完全静默。
+  // 体检/巡检这类任务天天跑, 天天报「一切正常」就是噪音。
+  if (t.exec) {
+    const r = await runShell(t.exec, Math.max(5000, Number(cfg.behavior.taskExecTimeoutMs) || 120000));
+    const body = String(r.out || '').trim();
+    if (!body) {
+      if (r.code !== 0) {
+        const tail = String(r.err || '').trim().split('\n').slice(-5).join('\n');
+        warn(`任务 ${t.id} 退出码 ${r.code} 且无输出`);
+        notifyTarget(target, `❌ 定时任务「${label}」执行失败（退出码 ${r.code}）${tail ? `\n${mdToPlain(tail)}` : ''}`).catch(() => {});
+      } else {
+        log(`任务 ${t.id} 无输出, 静默结束`);
+      }
+      return;
+    }
+    notifyTarget(target, body).catch(() => {});
+    return;
+  }
   if (!cfg.behavior.quietNotices) {
     notifyTarget(target, `⏰ 定时任务「${label}」执行中…`).catch(() => {});
   }
@@ -2326,8 +2371,9 @@ const HELP = [
   '/thinking 设置思考等级（/thinking max）',
   '/stats    查看 token 用量与上下文占用',
   '/compact  压缩上下文（/compact 自定义要求）',
-  '/memory   查看长期记忆（含群成员个人记忆）',
+  '/memory   查看长期记忆（/memory apply 应用整理稿）',
   '/task     查看定时任务列表',
+  '/tools    查看沉淀下来的脚本工具',
   '/reset    重启 pi 进程（当前会话保留）',
   '/restart  重启整个桥接（重新加载代码与配置）',
   '/steer    任务跑着时追加要求（不打断）',
@@ -2975,6 +3021,29 @@ async function dispatchCommand(session, cmd, arg, ctx) {
   return true;
   }
 
+  if (cmd === '/tools') {
+    // 沉淀下来的脚本。之前每次都是现写临时脚本, 下次又重写一遍。
+    const dir = path.join(String(cfg.pi.cwd || process.cwd()), 'tools');
+    let names = [];
+    try {
+      names = fs.readdirSync(dir).filter((f) => !f.startsWith('.') && f !== 'README.md').sort();
+    } catch { /* 目录还没建 */ }
+    if (!names.length) { await session.sendQQ('🧰 还没有沉淀的工具。'); return true; }
+    const lines = ['🧰 工具库', ''];
+    for (const f of names) {
+      let desc = '';
+      try {
+        const head = fs.readFileSync(path.join(dir, f), 'utf8').split('\n').slice(0, 15);
+        const hit = head.find((l) => /^#\s*desc\s*[:：]/i.test(l));
+        if (hit) desc = hit.replace(/^#\s*desc\s*[:：]\s*/i, '').trim();
+      } catch { /* 读不了就只列名字 */ }
+      lines.push(`• ${f}${desc ? ` — ${desc}` : ''}`);
+    }
+    lines.push('', `目录: ${dir}`);
+    for (const part of splitForQQ(lines.join('\n'), cfg.behavior.maxChars)) await session.sendQQ(part);
+    return true;
+  }
+
   if (cmd === '/stats') {
     try {
       const s = await session.request({ type: 'get_session_stats' });
@@ -3023,6 +3092,33 @@ async function dispatchCommand(session, cmd, arg, ctx) {
 
   if (cmd === '/memory') {
     try {
+      // 记忆整理稿的收发。整理稿由定时任务生成, 但不自动生效 ——
+      // 合并记忆会删东西, 得让主人先过一眼再决定。
+      const sub = String(arg || '').trim().toLowerCase();
+      if (sub === 'apply' || sub === 'discard' || sub === 'diff') {
+        if (isGroup) { await session.sendQQ('记忆整理请在私聊里做。'); return true; }
+        const prop = `${memPath(key)}.proposed`;
+        if (!fs.existsSync(prop)) { await session.sendQQ('📭 没有待处理的记忆整理稿。'); return true; }
+        if (sub === 'diff') {
+          const before = readMemory(key);
+          const after = fs.readFileSync(prop, 'utf8');
+          for (const part of splitForQQ(`📝 待应用的整理稿\n\n【现在】\n${before || '（空）'}\n\n【整理后】\n${after}`,
+            cfg.behavior.maxChars)) await session.sendQQ(part);
+          return true;
+        }
+        if (sub === 'discard') {
+          try { fs.unlinkSync(prop); } catch { /* 已经没了 */ }
+          await session.sendQQ('🗑 整理稿已丢弃，记忆保持原样。');
+          return true;
+        }
+        // apply: 先留一份原件再覆盖, 改坏了能换回来
+        const before = readMemory(key);
+        try { fs.writeFileSync(`${memPath(key)}.bak-${Date.now()}`, before); } catch { /* 备份失败也要继续 */ }
+        fs.writeFileSync(memPath(key), fs.readFileSync(prop, 'utf8'));
+        try { fs.unlinkSync(prop); } catch { /* 已经没了 */ }
+        await session.sendQQ('✅ 记忆整理稿已应用。原件留在 memory/ 下（.bak- 开头），不满意就说一声换回来。');
+        return true;
+      }
       const lines = [];
       if (isGroup) {
         // 群聊: 群公共记忆 + 各成员个人记忆
@@ -3748,5 +3844,6 @@ if (require.main === module) {
     start, fatal, onebot, sessions,
     requestRestart, maybeRestartNow, busySessionCount, setExitHook, restartState, getSession,
     markRestart, takeRestartMark, RESTART_MARK,
+    normalizeTask, runShell,
   };
 }

@@ -30,7 +30,7 @@ fs.writeFileSync(path.join(BASE, 'config.json'), JSON.stringify({
 
 const src = fs.readFileSync(path.join(__dirname, 'bridge.js'), 'utf8');
 fs.writeFileSync(path.join(BASE, 'bridge.js'), `${src}
-module.exports = { PiSession, sessions, alertTarget, cfg, onebot, fetchGroupContext, GROUP_CTX_CACHE, sweepStorage, STATE, dispatchCommand, HELP, requestRestart, maybeRestartNow, busySessionCount, setExitHook, restartState, mdToPlain, getSession, creatingSessions, markRestart, takeRestartMark, RESTART_MARK };
+module.exports = { PiSession, sessions, alertTarget, cfg, onebot, fetchGroupContext, GROUP_CTX_CACHE, sweepStorage, STATE, dispatchCommand, HELP, requestRestart, maybeRestartNow, busySessionCount, setExitHook, restartState, mdToPlain, getSession, creatingSessions, markRestart, takeRestartMark, RESTART_MARK, normalizeTask, runShell };
 `);
 
 const results = [];
@@ -916,6 +916,99 @@ const ok = (name, pass, extra) => { results.push({ name, pass }); console.log(`$
     s.pending.set('req_x', { resolve: (d) => { resolved = d; }, reject: () => {}, timer: setTimeout(() => {}, 0) });
     s.onRecord({ type: 'response', id: 'req_x', command: 'get_state', success: true, data: { ok: 1 } });
     ok('pending 的正常响应仍被派发', resolved && resolved.ok === 1);
+  }
+
+  // ---- 修复 28: exec 型定时任务(体检) —— 没输出就必须完全静默
+  {
+    const mk = (over) => B.normalizeTask(Object.assign({
+      id: 'x', target: 'private_123456789', schedule: { type: 'daily', time: '09:00' },
+    }, over), 'test');
+    const t1 = mk({ exec: 'echo hi' });
+    ok('exec 任务能被接受', !!t1 && t1.exec === 'echo hi' && t1.prompt === '', JSON.stringify(t1 && t1.exec));
+    ok('prompt 任务仍然正常', (mk({ prompt: '说话' }) || {}).prompt === '说话');
+    ok('既没 prompt 也没 exec 的任务被拒绝', mk({}) === null);
+    ok('白名单外的目标仍被拒绝',
+      B.normalizeTask({ id: 'z', target: 'private_1', schedule: { type: 'daily', time: '09:00' }, exec: 'true' }, 'test') === null);
+
+    const r1 = await B.runShell('echo hello', 5000);
+    ok('runShell 拿到输出', r1.out.trim() === 'hello' && r1.code === 0, JSON.stringify(r1));
+    const r2 = await B.runShell('true', 5000);
+    ok('runShell 无输出时 out 为空', r2.out.trim() === '' && r2.code === 0, JSON.stringify(r2));
+    const r3 = await B.runShell('echo oops >&2; exit 3', 5000);
+    ok('runShell 传回退出码与 stderr', r3.code === 3 && r3.err.includes('oops'), JSON.stringify(r3));
+    const r4 = await B.runShell('sleep 30', 700);
+    ok('runShell 超时会杀掉子进程', r4.code === -1 && r4.err.includes('超时'), JSON.stringify(r4).slice(0, 140));
+  }
+
+  // ---- 修复 29: /tools 工具库
+  {
+    const dir = path.join(BASE, 'workspace', 'tools');
+    fs.mkdirSync(dir, { recursive: true });
+    const sent = [];
+    const fake = {
+      key: 'private_32', busy: false, queue: [], lastResumeList: null, lastModelList: null,
+      stderrTail: [], beginWork() {}, endWork() {},
+      sendQQ: async (t) => { sent.push(String(t)); return { status: 'ok' }; },
+      request: async () => ({}), send: () => true, abortRequested: false,
+    };
+    const ctx = { isGroup: false, userId: '123456789', groupId: '', userName: '主人', key: 'private_32' };
+
+    sent.length = 0;
+    await B.dispatchCommand(fake, '/tools', '', ctx);
+    ok('/tools 空目录有提示', sent.some((t) => t.includes('还没有沉淀')), JSON.stringify(sent));
+
+    fs.writeFileSync(path.join(dir, 'demo.sh'), '#!/bin/bash\n# desc: 演示脚本\n');
+    fs.writeFileSync(path.join(dir, 'no-desc.sh'), '#!/bin/bash\necho hi\n');
+    sent.length = 0;
+    await B.dispatchCommand(fake, '/tools', '', ctx);
+    const all = sent.join('');
+    ok('/tools 列出脚本与描述', all.includes('demo.sh') && all.includes('演示脚本'), all.slice(0, 200));
+    ok('/tools 没描述的脚本也列出来', all.includes('no-desc.sh'), all.slice(0, 200));
+  }
+
+  // ---- 修复 30: 记忆整理稿要人工确认才生效
+  {
+    const memDir = path.join(BASE, 'memory');
+    fs.mkdirSync(memDir, { recursive: true });
+    const mp = path.join(memDir, 'private_33.md');
+    const prop = `${mp}.proposed`;
+    fs.writeFileSync(mp, '- 旧记忆\n');
+    const sent = [];
+    const fake = {
+      key: 'private_33', busy: false, queue: [], lastResumeList: null, lastModelList: null,
+      stderrTail: [], beginWork() {}, endWork() {},
+      sendQQ: async (t) => { sent.push(String(t)); return { status: 'ok' }; },
+      request: async () => ({}), send: () => true, abortRequested: false,
+    };
+    const ctx = { isGroup: false, userId: '123456789', groupId: '', userName: '主人', key: 'private_33' };
+
+    sent.length = 0;
+    await B.dispatchCommand(fake, '/memory', 'apply', ctx);
+    ok('没有整理稿时 apply 给提示', sent.some((t) => t.includes('没有待处理')), JSON.stringify(sent));
+
+    fs.writeFileSync(prop, '- 新记忆\n');
+    sent.length = 0;
+    await B.dispatchCommand(fake, '/memory', 'diff', ctx);
+    ok('/memory diff 显示前后对比',
+      sent.join('').includes('旧记忆') && sent.join('').includes('新记忆'), sent.join('').slice(0, 200));
+
+    sent.length = 0;
+    await B.dispatchCommand(fake, '/memory', 'apply', ctx);
+    ok('/memory apply 换上了整理稿', fs.readFileSync(mp, 'utf8').includes('新记忆'));
+    ok('/memory apply 删掉了整理稿', !fs.existsSync(prop));
+    ok('/memory apply 留了备份',
+      fs.readdirSync(memDir).some((f) => f.startsWith('private_33.md.bak-')));
+
+    fs.writeFileSync(prop, '- 又一份\n');
+    sent.length = 0;
+    await B.dispatchCommand(fake, '/memory', 'discard', ctx);
+    ok('/memory discard 丢弃整理稿且不动记忆',
+      !fs.existsSync(prop) && fs.readFileSync(mp, 'utf8').includes('新记忆'));
+
+    // 群聊里不该允许改记忆
+    sent.length = 0;
+    await B.dispatchCommand(fake, '/memory', 'apply', { ...ctx, isGroup: true });
+    ok('群聊里拒绝应用记忆整理', sent.some((t) => t.includes('私聊')), JSON.stringify(sent));
   }
 
   console.log('\n===== 结果 =====');
