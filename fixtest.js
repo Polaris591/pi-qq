@@ -400,6 +400,40 @@ const ok = (name, pass, extra) => { results.push({ name, pass }); console.log(`$
     ok('不再误报 pi 未就绪', !sent.some((t) => t.includes('pi 未就绪')));
   }
 
+  // ---- 修复 14: agent_end 时就该把已生成好的回复发出去
+  {
+    const s = new B.PiSession('private_50', { type: 'private', id: '50' });
+    const sent = [];
+    s.sendQQ = async (t) => { sent.push(String(t)); return { status: 'ok' }; };
+    s.proc = { stdin: { writable: true, write: (d, cb) => { if (cb) cb(null); }, on: () => {} } };
+    s.busy = true;
+    s.buf = '这是已经生成好的回答。'.repeat(5);
+
+    // agent_end + stopReason=stop => 应立刻 flush
+    s.onRecord({ type: 'agent_end', messages: [{ stopReason: 'stop' }] });
+    await new Promise((r) => setTimeout(r, 40));
+    ok('agent_end(stop) 立刻发出缓冲内容', sent.length > 0 && sent.join('').includes('已经生成好的回答'),
+      `sent=${sent.length}`);
+    ok('agent_end 后 buf 已清空', s.buf === '', `buf=${JSON.stringify(s.buf).slice(0, 40)}`);
+
+    // stopReason=toolUse => 不该 flush (这一轮还没结束)
+    sent.length = 0;
+    s.buf = '中间过程文字'.repeat(5);
+    s.onRecord({ type: 'agent_end', messages: [{ stopReason: 'toolUse' }] });
+    await new Promise((r) => setTimeout(r, 40));
+    ok('agent_end(toolUse) 不发', sent.length === 0, `sent=${sent.length}`);
+
+    // 定时任务会话的 error 走 onTaskError, 不应重复发
+    s.buf = '';
+    s.onTaskError = () => { s.taskErrCalled = true; };
+    sent.length = 0;
+    s.onRecord({ type: 'agent_end', messages: [{ stopReason: 'error' }] });
+    await new Promise((r) => setTimeout(r, 40));
+    ok('任务会话的 error 交给 onTaskError', s.taskErrCalled === true && sent.length === 0,
+      `called=${s.taskErrCalled} sent=${sent.length}`);
+    s.closed = true;
+  }
+
   console.log('\n===== 结果 =====');
   const bad = results.filter((r) => !r.pass);
   console.log(`通过 ${results.length - bad.length}/${results.length}`);

@@ -893,6 +893,12 @@ class PiSession {
         const msgs = rec.messages || [];
         const last = msgs[msgs.length - 1];
         const reason = last && last.stopReason;
+        // 这一轮已经产出最终回答了 (stop / length), 但 pi 可能还要再发 agent_settled。
+        // 实测这中间能隔好几分钟 —— 期间如果只等 settled 才 flush, 用户就一直看不到
+        // 已经生成好的回复。所以这里先强制发一次, settled 那次再发就是空操作。
+        if (reason && reason !== 'toolUse' && reason !== 'error') {
+          this.flush(true).catch((e) => warn(`[${this.key}] flush 失败: ${e.message}`));
+        }
         if (reason === 'error' && !this.abortRequested) {
           // 定时任务: 交给 runTask 统一通知 (任务会话是临时的, 这里发不出去)
           if (typeof this.onTaskError === 'function') { this.onTaskError('模型调用出错'); break; }
@@ -909,6 +915,7 @@ class PiSession {
         this.silenceNotices = 0;
         this.lastSilenceNoticeAt = 0;
         this.busy = false;
+        debug(`[${this.key}] busy=false (agent_settled)`);
         this.abortRequested = false;
         this.lastUsed = Date.now();
         this.stderrTail = [];
@@ -1097,6 +1104,7 @@ class PiSession {
       return;
     }
     this.busy = true;
+    debug(`[${this.key}] busy=true (prompt)`);
     this.turnCtx = ctx || this.ctx || this.lastCtx;
     this.lastFlush = Date.now();
     // 新一轮开始, 重置静默提醒计数
@@ -3344,11 +3352,13 @@ function start() {
   // 与单轮看门狗互补: 那个是「打断」, 这个是「先告诉用户我还活着」。
   const SILENCE_MS = Math.max(0, Number(cfg.behavior.silenceNoticeMs) || 0);
   const SILENCE_MAX = Math.max(1, Number(cfg.behavior.silenceNoticeMax) || 5);
+  log(`静默提醒: ${SILENCE_MS ? `每 ${Math.max(5000, Math.min(15000, Math.floor(SILENCE_MS / 3)))}ms 检查, 阈值 ${SILENCE_MS}ms, 最多 ${SILENCE_MAX} 次` : '已关闭'}`);
   if (SILENCE_MS) {
     silenceTimer = setInterval(() => {
       const now = Date.now();
       for (const [k, s] of sessions) {
         if (s.closed) continue;
+        debug(`[${k}] tick busy=${s.busy} work=${s.workLabel || '-'} idle=${Math.round((now - (s.lastOutputAt || s.lastEventAt || now)) / 1000)}s sent=${s.silenceNotices || 0}`);
         // busy = 正在跑一轮 prompt; workLabel = 正在跑一个耗时的非 prompt 操作
         if (!s.busy && !s.workLabel) continue;
         const idle = now - (s.lastOutputAt || s.lastEventAt || now);
