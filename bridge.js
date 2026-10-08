@@ -1109,7 +1109,13 @@ class PiSession {
     if (images && images.length) cmd.images = images;
     if (!this.send(cmd)) {
       this.busy = false;
-      this.sendQQ('⚠️ pi 未就绪，请稍后重试。', { plain: true })
+      // 区分两种失败: 真未就绪 vs 会话刚被销毁(并发竞态)。
+      // 后者最典型的场景: 两条消息几乎同时到, 第一条 /reset 把实例销毁了,
+      // 第二条手里的引用就废了 —— 此时说「pi 未就绪」是误导。
+      const why = this.closed
+        ? '⚠️ 会话刚刚被重置，这条消息没能发出去，请重发一下。'
+        : '⚠️ pi 未就绪，请稍后重试。';
+      this.sendQQ(why, { plain: true })
         .catch((e) => warn(`[${this.key}] 未就绪提示发送失败: ${e.message}`));
     }
   }
@@ -1301,7 +1307,10 @@ setInterval(() => {
   for (const [k, v] of sessions) {
     if (!v.busy && now - v.lastUsed > cfg.behavior.idleTimeoutMs) {
       sessions.delete(k);
-      v.destroy('idle');
+      // 必须 .catch: destroy 是 async, 未处理的 rejection 会变成
+      // unhandledRejection -> fatal() -> 整个桥接退出。LRU 那条路径是 await 的,
+      // 这里漏了 —— 一处漏网就能把服务干掉。
+      v.destroy('idle').catch((e) => warn(`[${k}] 回收闲置会话失败: ${e.message}`));
     }
   }
 }, 60 * 1000).unref();
@@ -1622,6 +1631,13 @@ function envPrompt() {
   return [
     '【运行环境】',
     '你现在通过 QQ 与用户对话（pi-qq 桥接），不是终端。回复会按字数切分后发送。',
+    '',
+    '【最重要的一条：别默不作声地干活】',
+    '你调工具时不会产生任何文字输出，用户那边就是一片死寂，看不到你在做什么。',
+    '所以：一旦要连续调多个工具，先输出一两句说明你要干什么；中间每完成一步，',
+    '就再输出一小句进展（查到了什么、下一步做什么）。不要等全部弄完才说话。',
+    '判断标准：如果你预估接下来会沉默超过半分钟，就必须先发一句话。',
+    '这不是可选建议 —— 用户已经为此反复抱怨过多次。',
     '',
     '交付文件给用户：用户看不到服务器上的文件。需要给文件（代码、报告、表格、图片、压缩包等）时，',
     `写入 ${OUTBOX_HOST}/ 目录，桥接会在 2 秒内自动发送到当前对话。`,
@@ -2519,11 +2535,14 @@ async function handleIncoming(rec) {
   log(`[${key}] <- ${text.slice(0, 120)}${parsed.images.length ? ` (+${parsed.images.length} 图)` : ''}`);
 
   const session = await getSession(target);
+  // 竞态兜底: 上面的 await 期间, 另一条并发消息可能已经把它 /reset 或 LRU 掉了。
+  // getSession 只返回未销毁的实例, 所以再取一次就能拿到干净的那个。
+  const live = session.closed ? await getSession(target) : session;
   // 群聊回复上下文: 引用触发消息并 @ 发送者。
   // 同一会话连续来消息时这里会被覆盖, 所以本轮回复用独立的 turnCtx 快照。
   const ctx = { replyTo: rec.message_id, atUser: isGroup ? userId : null, userId, userName };
-  session.ctx = ctx;
-  session.lastCtx = ctx;
+  live.ctx = ctx;
+  live.lastCtx = ctx;
 
   // 给触发消息贴表情 (仅群聊, 失败不影响主流程)
   if (cfg.behavior.emojiReaction && (cfg.behavior.emojiReactionScope === 'all' || isGroup)) {
@@ -2537,7 +2556,7 @@ async function handleIncoming(rec) {
   const cmd = c0.toLowerCase();
   const arg = cmdArgs.join(' ').trim();
   const cmdCtx = { isGroup, userId, groupId, userName, key };
-  if (await dispatchCommand(session, cmd, arg, cmdCtx)) return;
+  if (await dispatchCommand(live, cmd, arg, cmdCtx)) return;
 
 
   // ---- 图片下载并转 base64
@@ -3150,6 +3169,11 @@ async function sweepOutbox() {
     }
   } finally {
     outboxBusy = false;
+    // 有界: :err / :denied 标记只增不减, 长跑会慢慢泄漏。
+    // 超过上限就把最早插入的那批丢掉 —— 最坏结果是重试一次失败文件, 无副作用。
+    if (outboxSeen.size > 1000) {
+      for (const k of [...outboxSeen.keys()].slice(0, outboxSeen.size - 500)) outboxSeen.delete(k);
+    }
   }
 }
 
@@ -3215,7 +3239,7 @@ async function sweepStorage() {
 let outboxTimer = null;
 let taskTimer = null;
 let storageTimer = null;
-let heartbeatTimer = null;
+let selfHealTimer = null;
 let turnTimer = null;
 let silenceTimer = null;
 let watchdogTimer = null;
@@ -3269,7 +3293,7 @@ function start() {
   // 一个自持 ws 客户端掉线后会自己重连, 若进程整体被日志管道等外部原因卡住,
   // 这个定时器也会停摆 —— 那正是需要让 systemd 介入的信号。
   const SELF_HEAL_MS = Math.max(30000, Number(cfg.behavior.selfHealMs) || 120000);
-  heartbeatTimer = setInterval(() => {
+  selfHealTimer = setInterval(() => {
     const st = onebot.ws && onebot.ws.readyState;
     const alive = st === WebSocket.OPEN || st === WebSocket.CONNECTING;
     const idle = Date.now() - lastSeenAt;
@@ -3277,7 +3301,7 @@ function start() {
       fatal('self-heal', new Error(`WS 已断开且 ${Math.round(idle / 1000)}s 无上报, 触发重启`));
     }
   }, SELF_HEAL_MS);
-  heartbeatTimer.unref();
+  selfHealTimer.unref();
 
   // systemd 看门狗: 定期喂狗。事件循环一旦被阻塞(同步 IO / 死循环), 这个定时器
   // 就不再触发, systemd 会按 WatchdogSec 判定卡死并重启服务。
@@ -3366,7 +3390,7 @@ async function shutdown(reason) {
   if (outboxTimer) clearInterval(outboxTimer);
   if (storageTimer) clearInterval(storageTimer);
   if (taskTimer) clearInterval(taskTimer);
-  if (heartbeatTimer) clearInterval(heartbeatTimer);
+  if (selfHealTimer) clearInterval(selfHealTimer);
   if (turnTimer) clearInterval(turnTimer);
   if (silenceTimer) clearInterval(silenceTimer);
   if (watchdogTimer) clearInterval(watchdogTimer);

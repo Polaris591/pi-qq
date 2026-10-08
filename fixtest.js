@@ -385,6 +385,21 @@ const ok = (name, pass, extra) => { results.push({ name, pass }); console.log(`$
       (await B.dispatchCommand(s3, '/restart', '', { ...ctx, isGroup: true })) === true);
   }
 
+  // ---- 修复 13: 已销毁的会话再 prompt, 提示要准确而不是误导
+  {
+    const s = new B.PiSession('private_40', { type: 'private', id: '40' });
+    const sent = [];
+    s.sendQQ = async (t) => { sent.push(String(t)); return { status: 'ok' }; };
+    s.proc = null;              // 模拟被 destroy 之后的实例
+    s.closed = true;
+    s.busy = false;
+    s.prompt('hello', [], { replyTo: null, atUser: null });
+    await new Promise((r) => setTimeout(r, 30));
+    ok('已销毁会话 prompt 会给出准确提示',
+      sent.some((t) => t.includes('会话刚刚被重置')), JSON.stringify(sent).slice(0, 120));
+    ok('不再误报 pi 未就绪', !sent.some((t) => t.includes('pi 未就绪')));
+  }
+
   console.log('\n===== 结果 =====');
   const bad = results.filter((r) => !r.pass);
   console.log(`通过 ${results.length - bad.length}/${results.length}`);
