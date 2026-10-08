@@ -831,12 +831,10 @@ class PiSession {
         const startedAt = this.toolStarted.get(rec.toolCallId);
         this.toolStarted.delete(rec.toolCallId);
         this.phase = 'writing';
+        // 工具名与耗时只写日志, 不发 QQ —— 用户明确表示不想看到这类提示
         if (startedAt) {
           const secs = Math.round((Date.now() - startedAt) / 1000);
-          // 只报慢工具: 秒级完成的报出来纯属刷屏
-          if (secs >= 5) {
-            this.sendQQ(`✅ ${rec.toolName || '工具'} 完成（耗时 ${secs}s）`, { plain: true }).catch(() => {});
-          }
+          if (secs >= 5) log(`[${this.key}] 工具 ${rec.toolName || '?'} 耗时 ${secs}s`);
         }
         break;
       }
@@ -3200,12 +3198,9 @@ function start() {
         s.silenceNotices = sent + 1;
         s.lastSilenceNoticeAt = now;
         const secs = Math.round(idle / 1000);
-        // 说清楚卡在哪一步, 比单纯报个秒数有用得多
-        const where = s.workLabel || (s.phase === 'thinking' ? '模型正在思考'
-          : (s.phase && s.phase.startsWith('tool:') ? `正在跑 ${s.phase.slice(5)}`
-            : (s.phase === 'writing' ? '正在生成回复' : '没有新进展')));
-        const tip = sent === 0 ? `（当前：${where}）` : '';
-        s.sendQQ(`⏳ 还在跑，已经 ${secs} 秒没有新输出了${tip}。要停就发 /stop。`, { plain: true })
+        // 具体卡在哪一步(思考/哪个工具)只写日志, 不发 QQ
+        if (s.workLabel || s.phase) log(`[${k}] 静默 ${secs}s, 当前: ${s.workLabel || s.phase}`);
+        s.sendQQ(`⏳ 还在跑，已经 ${secs} 秒了，有结果我会马上发出来。要停就发 /stop。`, { plain: true })
           .catch((e) => warn(`[${k}] 静默提醒发送失败: ${e.message}`));
       }
     }, Math.max(5000, Math.min(15000, Math.floor(SILENCE_MS / 3))));

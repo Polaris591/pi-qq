@@ -36,7 +36,7 @@
     "idleTimeoutMs": 7200000,
     "maxChars": 2500,
     "flushIntervalMs": 6000,
-    "progressOnToolCall": true,
+    "progressOnToolCall": false,
     "progressMinIntervalMs": 3000,
     "silenceNoticeMs": 45000,
     "silenceNoticeMax": 8,
