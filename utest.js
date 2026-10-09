@@ -44,6 +44,7 @@ fs.writeFileSync(path.join(BASE, 'bridge.js'), `${src}
 module.exports = {
   parseTimeOfDay, parseOnce, normalizeSchedule, nextRunAt, normalizeTask,
   describeTask, taskTargetAllowed, mergeTaskFiles, recalcTasks, tickTasks,
+  readCapped, sessionUsable, busySessionCount, taskSessions,
   memoryPrompt, memoryPromptFile, readMemory, memPath, ensureTasksDir, cfg,
   parseMessage, splitForQQ, isImagePath, isTextPath, humanSize, slug,
   PiSession, onebot, fetchGroupContext,
@@ -63,6 +64,13 @@ module.exports = {
 };
 `);
 
+// tasks.json 是运行期落盘的, 同样可能被手工或 pi 改坏 —— 加载时必须过一遍校验。
+// 这里放一条白名单外的 exec 任务: 修好之前它会被直接执行, 而且一声不响。
+fs.writeFileSync(path.join(BASE, 'tasks.json'), JSON.stringify([
+  { id: 'tj', target: 'private_123456789', schedule: { type: 'daily', time: '07:00' }, prompt: 'ok' },
+  { id: 'tbad', target: 'private_9999999', schedule: { type: 'daily', time: '07:00' }, exec: 'echo pwn' },
+]));
+
 const B = require(path.join(BASE, 'bridge.js'));
 
 const results = [];
@@ -70,6 +78,12 @@ const ok = (name, pass, extra = '') => {
   results.push({ name, pass });
   console.log(`${pass ? 'PASS' : 'FAIL'}  ${name}${extra ? `  ${extra}` : ''}`);
 };
+
+// ---- tasks.json 加载校验 (以前是直接赋值, 白名单外的任务会被执行)
+ok('tasks.json 里的合法任务被加载', B.TASKS.some((t) => t.id === 'tj'), JSON.stringify(B.TASKS.map((t) => t.id)));
+ok('tasks.json 里白名单外的任务被丢弃', !B.TASKS.some((t) => t.id === 'tbad'));
+ok('tasks.json 只留下合法的那条', B.TASKS.length === 1, `count=${B.TASKS.length}`);
+B.TASKS.length = 0;   // 后面的用例假设 TASKS 从空开始
 
 // ---- 时间解析
 ok('parseTimeOfDay 08:00', JSON.stringify(B.parseTimeOfDay('08:00')) === '{"h":8,"mi":0,"se":0}');
@@ -377,7 +391,10 @@ B.mergeTaskFiles();
 ok('合并 2 个有效任务', B.TASKS.length === 2, `count=${B.TASKS.length}`);
 ok('白名单外被过滤', !B.TASKS.some((t) => t.id === 'tc'));
 ok('坏文件不中断', B.TASKS.some((t) => t.id === 'ta') && B.TASKS.some((t) => t.id === 'tb'));
-ok('合并后删除任务文件', !fs.existsSync(path.join(BASE, 'tasks', 'a.json')) && !fs.existsSync(path.join(BASE, 'tasks', 'b.json')));
+ok('合并后删除已生效的任务文件', !fs.existsSync(path.join(BASE, 'tasks', 'a.json')));
+// b.json 里混了一条白名单外的任务: 校验不过就保留原文件, 不能一声不吽地删掉
+ok('含不合法条目的任务文件被保留', fs.existsSync(path.join(BASE, 'tasks', 'b.json')));
+ok('坏 json 文件也保留', fs.existsSync(path.join(BASE, 'tasks', 'c.json')));
 ok('tasks.json 已落盘', fs.existsSync(path.join(BASE, 'tasks.json')));
 B.recalcTasks();
 ok('recalcTasks 计算 nextRun', B.TASKS.every((t) => t.nextRun > 0), B.TASKS.map((t) => new Date(t.nextRun).toISOString()).join(' '));
@@ -626,6 +643,71 @@ ok('多个引用只取第一个', pm5.replyId === '1');
   await new Promise((r) => setTimeout(r, 10));
   B.onebot.onRecord({ post_type: 'meta_event', meta_event_type: 'heartbeat', status: { online: true, good: true } });
   ok('上报重置看门狗时间', B.getLastSeen() > before);
+
+  // ---- 记忆超限时读尾部 (读头部会导致新条目永远读不到)
+  {
+    const f = path.join(BASE, 'memtail.md');
+    const lines = [];
+    for (let i = 0; i < 300; i++) lines.push(`- 第 ${i} 条记忆内容 ${'x'.repeat(30)}`);
+    fs.writeFileSync(f, `${lines.join('\n')}\n`);
+    const got = B.readCapped(f, 2000);
+    ok('readCapped 超限时保留最新条目', got.includes('第 299 条'), `len=${got.length}`);
+    ok('readCapped 超限时丢掉最旧的', !got.includes('第 0 条'), '');
+    ok('readCapped 不留半行残句', !/^条记忆内容/.test(got.split('\n')[0]), got.split('\n')[0].slice(0, 20));
+    const small = path.join(BASE, 'memsmall.md');
+    fs.writeFileSync(small, '  只有一条  \n');
+    ok('readCapped 小文件原样返回', B.readCapped(small, 2000) === '只有一条', B.readCapped(small, 2000));
+  }
+
+  // ---- 会话可用性: 退避重启中的实例不能被当成「已死」而重建
+  {
+    const timer = setTimeout(() => {}, 1000);
+    ok('退避等待中的会话仍可用', B.sessionUsable({ closed: false, proc: null, respawnTimer: timer }) === true);
+    ok('真正死掉的会话不可用', B.sessionUsable({ closed: false, proc: null, respawnTimer: null }) === false);
+    ok('已销毁的会话不可用', B.sessionUsable({ closed: true, proc: {} }) === false);
+    ok('有进程的会话可用', B.sessionUsable({ closed: false, proc: {} }) === true);
+    clearTimeout(timer);
+  }
+
+  // ---- 退避重启期间消息进队列, 不重建进程
+  {
+    const s = mk();
+    s.respawnTimer = setTimeout(() => {}, 1000);
+    s.sendQQ = async (t) => { sent.push({ params: { message: t } }); };
+    s.prompt('重启期间的消息', [], { userId: '9', userName: '小明' });
+    ok('退避期间消息进队列', s.queue.length === 1 && s.busy === false, `q=${s.queue.length} busy=${s.busy}`);
+    ok('退避期间提示用户在重启', sent.some((x) => String(x.params.message).includes('pi 正在重启')), '');
+    let cmds = 0;
+    s.send = () => { cmds++; return true; };
+    s.drainQueue();
+    ok('进程不在时 drainQueue 不派发', cmds === 0 && s.queue.length === 1, `cmd=${cmds}`);
+    clearTimeout(s.respawnTimer);
+  }
+
+  // ---- 定时任务会话要算「在忙」, 否则 /restart 会把它拦腰砍掉
+  {
+    B.taskSessions.clear();
+    ok('空闲时 busySessionCount=0', B.busySessionCount() === 0, `n=${B.busySessionCount()}`);
+    const fake = { busy: true };
+    B.taskSessions.add(fake);
+    ok('定时任务在忙时计入', B.busySessionCount() === 1, `n=${B.busySessionCount()}`);
+    B.taskSessions.delete(fake);
+  }
+
+  // ---- schedule 坏掉的任务不能中断整轮巡检
+  {
+    B.TASKS.push({ id: 'tnosched', enabled: true, nextRun: 0, target: { type: 'private', id: '123456789' } });
+    B.TASKS.push({ id: 'tgood', enabled: true, nextRun: 0, target: { type: 'private', id: '123456789' }, schedule: { type: 'daily', time: '08:00' }, prompt: 'x' });
+    let threw = false;
+    try { await B.tickTasks(); } catch { threw = true; }
+    ok('缺 schedule 的任务不抛错', !threw);
+    ok('缺 schedule 的任务被停用', B.TASKS.find((t) => t.id === 'tnosched').enabled === false);
+    ok('它后面的任务仍被调度', B.TASKS.find((t) => t.id === 'tgood').nextRun > 0,
+      `nextRun=${B.TASKS.find((t) => t.id === 'tgood').nextRun}`);
+    for (let i = B.TASKS.length - 1; i >= 0; i--) {
+      if (['tnosched', 'tgood'].includes(B.TASKS[i].id)) B.TASKS.splice(i, 1);
+    }
+  }
 
   B.onebot.action = orig;
   console.log('\n===== 结果 =====');

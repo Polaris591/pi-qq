@@ -193,9 +193,29 @@ for f in "$TMP"/*; do
   fi
 done
 
+# 提交并推送。抽成函数是因为「内容无变化但仓库里有未提交的改动」也要能推上去 ——
+# 以前 CHANGED=0 时直接 exit, 第二次跑 --push 就永远提交不了。
+commit_and_push() {
+  log ""
+  log "提交并推送..."
+  cd "$PUB_DIR"
+  if [ -z "$(git status --porcelain)" ]; then
+    log "  没有实际变化"
+  else
+    MSG="${1:-sync: 从运行版同步}"
+    git add -A
+    git commit -q -m "$MSG"
+    git push -q origin "$(git rev-parse --abbrev-ref HEAD)"
+    log "  已推送: $MSG"
+  fi
+}
+
 if [ "$CHANGED" -eq 0 ]; then
   log ""
   log "已经是最新的, 无需同步。"
+  if [ "${1:-}" = "--push" ] && [ -d "$PUB_DIR/.git" ]; then
+    commit_and_push "${2:-}"
+  fi
   exit 0
 fi
 
@@ -223,18 +243,7 @@ done
 # ---------------------------------------------------------------- 可选: 提交推送
 
 if [ "${1:-}" = "--push" ]; then
-  log ""
-  log "提交并推送..."
-  cd "$PUB_DIR"
-  if [ -z "$(git status --porcelain)" ]; then
-    log "  没有实际变化"
-  else
-    MSG="${2:-sync: 从运行版同步}"
-    git add -A
-    git commit -q -m "$MSG"
-    git push -q origin "$(git rev-parse --abbrev-ref HEAD)"
-    log "  已推送: $MSG"
-  fi
+  commit_and_push "${2:-}"
 fi
 
 log ""

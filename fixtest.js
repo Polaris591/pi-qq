@@ -1028,6 +1028,37 @@ const ok = (name, pass, extra) => { results.push({ name, pass }); console.log(`$
     fs.rmSync(path.join(tdir, 'broken.json'), { force: true });
   }
 
+  // ---- 修复 29: 会话被回收后不能返回「僵尸 promise」里的旧实例
+  // 形态: getSession 的并发去重表在同步完成的路径上先 delete 后 set, 留下一个永远
+  // resolved 的表项。会话被空闲回收后, getSession 一直返回那个已销毁的实例 ——
+  // 私聊永久「pi 未就绪」, 只能重启桥接。
+  {
+    B.sessions.clear();
+    B.creatingSessions.clear();
+    const target = { type: 'private', id: '91' };
+    const a = await B.getSession(target);
+    ok('首次 getSession 能建出新会话', !!a && !a.closed && !!a.proc);
+    ok('创建表不残留僵尸表项', B.creatingSessions.size === 0, `n=${B.creatingSessions.size}`);
+
+    // 模拟空闲回收: 从注册表移除 + 销毁
+    B.sessions.delete('private_91');
+    await a.destroy('idle');
+    const b = await B.getSession(target);
+    ok('回收后能重建出新实例', b !== a && !b.closed && !!b.proc,
+      `same=${b === a} closed=${b.closed} proc=${!!b.proc}`);
+    ok('新实例已回注册表', B.sessions.get('private_91') === b);
+
+    // 实例还在但子进程没了 (pi 崩了又没能重启): 也要重建, 不能交出去
+    b.proc = null;
+    const c = await B.getSession(target);
+    ok('子进程消失后重建', c !== b && !!c.proc && !c.closed,
+      `same=${c === b} proc=${!!c.proc}`);
+
+    await c.destroy('test');
+    B.sessions.clear();
+    B.creatingSessions.clear();
+  }
+
   console.log('\n===== 结果 =====');
   const bad = results.filter((r) => !r.pass);
   console.log(`通过 ${results.length - bad.length}/${results.length}`);

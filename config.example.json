@@ -67,7 +67,9 @@
     "thinkingGuardChars": 80000,
     "restartMaxWaitMs": 1800000,
     "quietNotices": false,
-    "restartNotice": true
+    "restartNotice": true,
+    "taskExecTimeoutMs": 900000,
+    "sessionWarnMB": 4
   },
   "persona": {
     "text": "",

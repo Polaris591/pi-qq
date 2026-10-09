@@ -107,6 +107,8 @@ const cfg = {
     quietNotices: false,
     // 自愈巡检间隔: WS 已死且长时间无上报时主动退出, 交由 systemd 拉起
     selfHealMs: 120000,
+    // 会话文件超过该体积(MB)时提示一次「该压缩了」, 0 关闭
+    sessionWarnMB: 4,
     ...(config.behavior || {}),
   },
   files: {
@@ -207,11 +209,16 @@ const debug = (...a) => { if (DEBUG_ON) console.log(ts(), '[debug]', ...a); };
 const NOTIFY_BIN = ['/usr/bin/systemd-notify', '/bin/systemd-notify', '/usr/local/bin/systemd-notify']
   .find((p) => { try { return fs.existsSync(p); } catch { return false; } }) || '';
 let notifyBusy = false;
+let notifyBusyAt = 0;
 let notifyWarned = false;
 
 function notify(msg) {
-  if (!process.env.NOTIFY_SOCKET || !NOTIFY_BIN || notifyBusy) return;
+  if (!process.env.NOTIFY_SOCKET || !NOTIFY_BIN) return;
+  // systemd-notify 子进程若卡住不退出, 这个标志会永久为 true, 之后就再也不喂狗,
+  // systemd 会按 WatchdogSec 判定卡死并把服务重启。超过 10 秒就放行。
+  if (notifyBusy && Date.now() - notifyBusyAt < 10000) return;
   notifyBusy = true;
+  notifyBusyAt = Date.now();
   const args = String(msg).split('\n').map((s) => s.trim()).filter(Boolean);
   let child;
   try {
@@ -255,7 +262,22 @@ const STATE_DIR = cfg.files.stateDir || ROOT;
 const STATE_PATH = path.join(STATE_DIR, 'state.json');
 ensureDir(STATE_DIR);
 let STATE = {};
-try { STATE = JSON.parse(fs.readFileSync(STATE_PATH, 'utf8')); } catch { STATE = {}; }
+let stateLoadError = '';
+let stateBrokenPath = '';
+try {
+  STATE = JSON.parse(fs.readFileSync(STATE_PATH, 'utf8'));
+} catch (e) {
+  STATE = {};
+  // 文件不存在 = 首次运行, 正常; 存在但读不动/解析不了就是出事了。
+  // 不能静默清零: 所有会话引用都会丢失, 30 天后 sweepStorage 会把会话文件当孤儿删掉,
+  // 用户的 /resume 历史就全没了。坏文件改名留档, 启动后再告警。
+  if (e.code !== 'ENOENT') {
+    stateLoadError = e.message;
+    stateBrokenPath = `${STATE_PATH}.broken-${Date.now()}`;
+    try { fs.renameSync(STATE_PATH, stateBrokenPath); } catch { stateBrokenPath = ''; }
+    warn(`状态文件损坏, 已留档到 ${stateBrokenPath || '(改名失败)'}: ${e.message}`);
+  }
+}
 
 function saveState() {
   try {
@@ -640,6 +662,7 @@ class PiSession {
     this.toolStarted = new Map();    // toolCallId -> 开始时刻 (进度提示用)
     this.lastToolNoticeAt = 0;       // 上次工具进度提示的时刻 (节流用)
     this.turnHadOutput = false;      // 本轮是否真的给用户发过东西 (空回复检测)
+    this.bigWarned = false;          // 是否已提示过「会话文件太大, 该压缩了」
     this.thinkChars = 0;             // 本轮思考累计字符数
     this.thinkGuardFired = false;    // 本轮是否已因思考过长中断过
     this.retryPending = false;       // 是否已排上「空回复自动重试」(期间不 drain 队列)
@@ -784,9 +807,14 @@ class PiSession {
     const onDead = (why, detail) => {
       if (dead) return;
       dead = true;
-      error(`[${this.key}] pi ${why}${detail ? ` ${detail}` : ''}`);
+      // 会话回收时 destroy 会关掉 stdin, pi 优雅退出 (code=0)。那不是故障,
+      // 记成 [error] 会污染 `journalctl | grep '\[error\]'` 这条排查路径。
+      const graceful = this.closed || /code=0/.test(detail || '');
+      if (graceful) log(`[${this.key}] pi 已退出 (${detail || why})`);
+      else error(`[${this.key}] pi ${why}${detail ? ` ${detail}` : ''}`);
       this.proc = null;
-      if (this.busy) {
+      // closed 说明是我们自己销毁的, 不该跟用户说「意外退出」
+      if (this.busy && !this.closed) {
         this.busy = false;
         this.flush(true).catch((e) => warn(`[${this.key}] flush 失败: ${e.message}`));
         // 必须 catch: sendQQ 失败会变成 unhandledRejection,
@@ -831,6 +859,8 @@ class PiSession {
       if (this.closed) return;
       this.spawnProc();
       this.syncSessionFile();
+      // 退避期间排下的消息现在可以发了
+      this.drainQueue();
     }, delay);
     warn(`[${this.key}] ${Math.round(delay / 1000)}s 后重启 pi (连续失败 ${n} 次)`);
   }
@@ -1042,6 +1072,7 @@ class PiSession {
         this.rejectRequeues = 0;   // 这一轮正常结束了, 被拒重试的计数清零
         this.lastUsed = Date.now();
         this.stderrTail = [];
+        this.warnBigSessionOnce();
         // 重试已排上时先别 drain: 否则队列里的消息会抢在重试前面跑,
         // 既打乱顺序又会覆盖 lastPrompt。等重试这一轮结束自然会 drain。
         if (!this.retryPending) this.drainQueue();
@@ -1153,6 +1184,25 @@ class PiSession {
   }
 
   /**
+   * 会话文件过大时提示一次。
+   * 上下文臃肿只能靠用户自己想起来 /compact, 而文件大小是唯一看得见的信号。
+   * 只提醒一次: 提醒完还不管, 那是用户的选择, 不该反复念叨。
+   */
+  warnBigSessionOnce() {
+    if (this.ephemeral || this.bigWarned || !this.sessionFile) return;
+    const limitMB = Number(cfg.behavior.sessionWarnMB) || 0;
+    if (!(limitMB > 0)) return;
+    let size = 0;
+    try { size = fs.statSync(this.sessionFile).size; } catch { return; }
+    if (size < limitMB * 1024 * 1024) return;
+    this.bigWarned = true;
+    const mb = (size / 1024 / 1024).toFixed(1);
+    this.sendQQ(`💡 这个会话已经 ${mb}MB 了，上下文偏大，回复会变慢也更费额度。`
+      + '建议 /compact 压一下，或者 /new 开个新的。', { plain: true })
+      .catch((e) => warn(`[${this.key}] 大会话提示发送失败: ${e.message}`));
+  }
+
+  /**
    * 「正忙」的统一定义: 正在跑一轮对话, 或者正在跑一个耗时的非 prompt 操作
    * (压缩上下文 / 切换会话 / 开启新会话)。命令守卫必须用它 ——
    * 只看 busy 会让 /compact 期间敲进来的命令和压缩流程打架。
@@ -1194,7 +1244,9 @@ class PiSession {
       );
       if (prefix) message = `${prefix}\n\n${text}`;
     }
-    if (this.busy || this.workLabel) {
+    // 进程正在退避重启中: 消息进队列等它回来, 而不是在这里重建进程
+    const waitingRespawn = !this.proc && !this.closed && !!this.respawnTimer;
+    if (this.busy || this.workLabel || waitingRespawn) {
       // 群里多人同时问时, 排队的人应该知道自己排到了哪 —— 否则只会觉得"没反应"。
       // 同一个人只提示一次(10 秒内不重复), 避免连发几条时刷屏。
       const now = Date.now();
@@ -1227,7 +1279,9 @@ class PiSession {
       // 消息被排住却一声不吭, 在用户那边和卡死没有区别 —— 那才是真的噪音。
       warnOnce('queued', this.workLabel
         ? `⏳ 正在${this.workLabel}，你这条已排队，好了就回。`
-        : `⏳ 前面还有 ${this.queue.length} 条在处理，你这条已排队。`);
+        : waitingRespawn
+          ? '⏳ pi 正在重启，你这条已排队，起来就发。'
+          : `⏳ 前面还有 ${this.queue.length} 条在处理，你这条已排队。`);
       return;
     }
     this.busy = true;
@@ -1279,7 +1333,8 @@ class PiSession {
   }
 
   drainQueue() {
-    if (this.busy || this.workLabel || !this.queue.length) return;
+    // 进程不在时不能派发: 消息留在队列里, 等 scheduleRespawn 重启完成后自己来取
+    if (this.busy || this.workLabel || !this.proc || !this.queue.length) return;
     const next = this.queue.shift();
     this.prompt(next.text, next.images, next.ctx);
   }
@@ -1403,6 +1458,9 @@ class PiSession {
 }
 
 const sessions = new Map();
+// 定时任务的临时会话: 不进 sessions 表(它们不属于任何 QQ 会话), 但同样要算「在忙」——
+// 否则 /restart 的「等空闲再重启」看不见它们, 会把正在跑的任务拦腰砍掉。
+const taskSessions = new Set();
 // 正在创建中的会话 (key -> Promise): 合并并发创建请求, 避免同一个会话被建两次
 const creatingSessions = new Map();
 
@@ -1426,10 +1484,22 @@ function sessionKey(target) {
   return target.type === 'group' ? `group_${target.id}` : `private_${target.id}`;
 }
 
+/** 会话实例是否还能用: 没销毁, 且子进程还在。
+ *  proc 为 null 说明 pi 已死且没能重启 —— 这种实例交出去只会让每条消息
+ *  都失败在 send() 上, 用户看到的就是「pi 未就绪」。 */
+function sessionUsable(s) {
+  if (!s || s.closed) return false;
+  if (s.proc) return true;
+  // 正在指数退避等重启: 交回给它自己, 让消息进队列等着。
+  // 若在这里返回 false, getSession 会立刻销毁重建 —— 每条新消息都绕过退避计时器,
+  // pi 因配置坏了起不来时就成了高频重启风暴 (群消息密的时候尤其明显)。
+  return !!s.respawnTimer;
+}
+
 async function getSession(target) {
   const key = sessionKey(target);
-  let s = sessions.get(key);
-  if (s && !s.closed) return s;
+  const s = sessions.get(key);
+  if (sessionUsable(s)) return s;
 
   // 并发保护: handleIncoming 是并发跑的(每条消息各自一个 promise), 同一个 key 的
   // 两条消息可能同时走到这里。而下面 LRU 淘汰那步有 await —— 期间两个调用都会
@@ -1440,9 +1510,20 @@ async function getSession(target) {
   if (inflight) return inflight;
 
   const p = (async () => {
+    // 关键: 先让出一次微任务, 保证下面的 creatingSessions.set() 一定先执行。
+    // 少了这一行, 同步走完的路径会在 set 之前就执行 finally 里的 delete ——
+    // 删除落空, 随后 set 把一个「永远 resolved 的僵尸 promise」留在表里。
+    // 会话被空闲回收后 getSession 就一直拿到那个已销毁的旧实例,
+    // 表现是私聊永久「pi 未就绪」, 只能重启桥接 (2026-10-09 线上就是这个形态)。
+    await null;
     try {
       const cur = sessions.get(key);
-      if (cur && !cur.closed) return cur;
+      if (sessionUsable(cur)) return cur;
+      if (cur) {
+        // 实例还在但子进程已经没了: 直接销毁重建, 否则后续每条消息都会失败
+        sessions.delete(key);
+        await cur.destroy('pi 已退出').catch((e) => warn(`[${key}] 清理死会话失败: ${e.message}`));
+      }
       if (sessions.size >= cfg.behavior.maxSessions) {
         // LRU 淘汰: 优先闲置会话; 全部忙碌时也淘汰最久未用的一个, 否则会话数会无限增长
         let oldest = null;
@@ -1740,16 +1821,31 @@ function groupMemberDir(groupId) {
   return path.join(groupMemDir(groupId), 'members');
 }
 
-/** 通用文件读取(带字节上限), 不存在/失败一律返回空串 */
+/**
+ * 通用文件读取(带字节上限), 不存在/失败一律返回空串。
+ *
+ * 超限时读**尾部**而不是头部: 记忆文件是追加写的, 新条目在最下面。
+ * 以前读头部, 一旦超过上限, 模型刚写下的条目就永远读不到 —— 它会以为自己没记住,
+ * 于是再写一遍, 文件继续涨, 变成「越记越忘」的死循环。
+ */
 function readCapped(file, maxBytes) {
   try {
     const st = fs.statSync(file);
     if (!st.isFile() || st.size === 0) return '';
+    const take = Math.min(st.size, maxBytes);
+    const start = st.size - take;
     const fd = fs.openSync(file, 'r');
-    const buf = Buffer.alloc(Math.min(st.size, maxBytes));
-    fs.readSync(fd, buf, 0, buf.length, 0);
+    const buf = Buffer.alloc(take);
+    fs.readSync(fd, buf, 0, take, start);
     fs.closeSync(fd);
-    return buf.toString('utf8').trim();
+    let s = buf.toString('utf8').trim();
+    // 截断点可能落在半行上, 丢掉开头那句残句
+    if (start > 0) {
+      const i = s.indexOf('\n');
+      const rest = i >= 0 ? s.slice(i + 1).trim() : '';
+      if (rest) s = rest;   // 万一整个文件只有一行且超长, 那就保留它
+    }
+    return s;
   } catch { return ''; }
 }
 
@@ -2001,7 +2097,23 @@ const TASK_PATH = path.join(STATE_DIR, 'tasks.json');
 let TASKS = [];
 try {
   const rawTasks = JSON.parse(fs.readFileSync(TASK_PATH, 'utf8'));
-  if (Array.isArray(rawTasks)) TASKS = rawTasks;
+  if (Array.isArray(rawTasks)) {
+    // 必须过一遍 normalizeTask: tasks.json 同样能被手工或 pi 改写, 不能因为
+    // 「是我们自己写的」就跳过白名单与格式校验。丢掉的条目要出声, 不静默消失。
+    for (const raw of rawTasks) {
+      const t = normalizeTask(raw, 'tasks.json');
+      if (!t) {
+        warn(`tasks.json 里有不合法的任务, 已忽略: ${JSON.stringify(raw).slice(0, 120)}`);
+        continue;
+      }
+      TASKS.push({
+        ...t,
+        lastRun: Number(raw.lastRun) || 0,
+        nextRun: Number(raw.nextRun) || 0,
+        createdAt: Number(raw.createdAt) || Date.now(),
+      });
+    }
+  }
 } catch { TASKS = []; }
 
 function saveTasks() {
@@ -2311,11 +2423,14 @@ async function runTask(t) {
 
   // 任务跑在独立会话里, 不污染用户当前对话的上下文
   const ps = new PiSession(key, target, { ephemeral: true });
+  // 登记进「在忙」统计: 定时任务跑的时候重启要等它
+  taskSessions.add(ps);
   try {
     await ps.ready();
     ps.prompt(t.prompt, [], { replyTo: null, atUser: null });
   } catch (e) {
     warn(`任务 ${t.id} 启动失败: ${e.message}`);
+    taskSessions.delete(ps);
     await ps.destroy('task failed');
     notifyTarget(target, `❌ 定时任务「${label}」启动失败: ${e.message}`).catch(() => {});
     return;
@@ -2328,6 +2443,7 @@ async function runTask(t) {
     finished = true;
     clearInterval(iv);
     clearTimeout(deadline);
+    taskSessions.delete(ps);
     await ps.destroy(why);
     if (errNote) notifyTarget(target, errNote).catch(() => {});
   };
@@ -2353,6 +2469,14 @@ async function tickTasks() {
   let dirty = false;
   for (const t of TASKS) {
     if (!t.enabled) continue;
+    // 兜底: schedule 结构坏掉的任务(手工改过 tasks.json)会让 t.schedule.type 抛错,
+    // 那会中断整轮巡检 —— 排在它后面的任务全部被跳过, 看起来就是「定时任务莫名不跑了」。
+    if (!t.schedule) {
+      warn(`任务 ${t.id} 缺少 schedule, 已停用`);
+      t.enabled = false;
+      dirty = true;
+      continue;
+    }
     if (!t.nextRun) { t.nextRun = nextRunAt(t, now); dirty = true; }
     if (!t.nextRun) {
       if (t.schedule.type === 'once') { t.enabled = false; dirty = true; }
@@ -3634,6 +3758,8 @@ function busySessionCount() {
   let n = 0;
   // workLabel 也要算: 压缩上下文这类长操作期间重启, 会把压缩流程拦腰砍断
   for (const [, s] of sessions) if (s.busy || s.retryPending || s.workLabel) n++;
+  // 定时任务会话不在 sessions 里, 单独数
+  for (const s of taskSessions) if (s.busy || s.workLabel) n++;
   return n;
 }
 
@@ -3823,6 +3949,13 @@ function start() {
     warn('⚠️ 群白名单为空且 allowAllGroups=false —— 群聊消息会被全部忽略。');
   }
 
+  // 状态文件坏过: 启动时就说一声, 否则用户以为会话历史都还在
+  if (stateLoadError) {
+    sendAlert(`⚠️ state.json 读取失败（${stateLoadError}）\n`
+      + `已把坏文件留档到 ${stateBrokenPath || '(改名失败)'}。\n`
+      + '会话引用现在是空的 —— 现有会话文件不会立刻丢，但 /resume 列表会变空。').catch(() => {});
+  }
+
   // 告诉 systemd 启动完成 (Type=notify)。放在最后: 此时 WS 与各定时器都已就位。
   notify('READY=1\nSTATUS=pi-qq 桥接运行中');
 }
@@ -3845,6 +3978,7 @@ async function shutdown(reason) {
   if (watchdogTimer) clearInterval(watchdogTimer);
   if (restartTimer) clearInterval(restartTimer);
   for (const [, s] of sessions) await s.destroy('shutdown');
+  for (const s of taskSessions) await s.destroy('shutdown');
   process.exit(0);
 }
 process.on('SIGTERM', shutdown);
