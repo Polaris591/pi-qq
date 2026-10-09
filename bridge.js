@@ -2269,9 +2269,21 @@ function taskTargetAllowed(target) {
 /** 校验一条外部任务定义, 返回归一化后的任务或 null */
 function normalizeTask(raw, source) {
   if (!raw || typeof raw !== 'object') return null;
-  const targetStr = String(raw.target || '');
-  const m = /^(private|group)_(\d+)$/.exec(targetStr);
-  if (!m) return null;
+  // target 支持两种写法, 缺一不可:
+  //   字符串 "private_123"   —— pi 写的任务文件
+  //   对象 { type, id }      —— saveTasks() 落盘到 tasks.json 后的形式
+  // 只认字符串的话, 从 tasks.json 读回来的任务会全部被当成非法丢掉。
+  let target = null;
+  if (raw.target && typeof raw.target === 'object') {
+    const type = String(raw.target.type || '');
+    const id = String(raw.target.id == null ? '' : raw.target.id);
+    if ((type === 'private' || type === 'group') && /^\d+$/.test(id)) target = { type, id };
+  } else {
+    const m = /^(private|group)_(\d+)$/.exec(String(raw.target || ''));
+    if (m) target = { type: m[1], id: m[2] };
+  }
+  if (!target) return null;
+  const targetStr = `${target.type}_${target.id}`;
   const schedule = normalizeSchedule(raw.schedule);
   if (!schedule) return null;
   const prompt = String(raw.prompt || '').trim();
@@ -2279,7 +2291,6 @@ function normalizeTask(raw, source) {
   // prompt / exec 二选一。exec 走脚本: 有输出才发, 没输出就完全不出声 ——
   // 体检这类「没事就别吭声」的任务不能交给模型去判断要不要说话。
   if (!prompt && !exec) return null;
-  const target = { type: m[1], id: m[2] };
   if (!taskTargetAllowed(target)) {
     warn(`任务目标不在白名单, 已忽略: ${targetStr} (${source || '?'})`);
     return null;

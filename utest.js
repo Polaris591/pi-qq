@@ -65,10 +65,12 @@ module.exports = {
 `);
 
 // tasks.json 是运行期落盘的, 同样可能被手工或 pi 改坏 —— 加载时必须过一遍校验。
+// 注意 target 在这里是**对象**(saveTasks 落盘后的形式), 不是任务文件里的字符串。
 // 这里放一条白名单外的 exec 任务: 修好之前它会被直接执行, 而且一声不响。
 fs.writeFileSync(path.join(BASE, 'tasks.json'), JSON.stringify([
-  { id: 'tj', target: 'private_123456789', schedule: { type: 'daily', time: '07:00' }, prompt: 'ok' },
-  { id: 'tbad', target: 'private_9999999', schedule: { type: 'daily', time: '07:00' }, exec: 'echo pwn' },
+  { id: 'tj', target: { type: 'private', id: '123456789' }, schedule: { type: 'daily', time: '07:00' }, prompt: 'ok' },
+  { id: 'tobj', target: { type: 'group', id: '10001' }, schedule: { type: 'every', minutes: 30 }, exec: 'true' },
+  { id: 'tbad', target: { type: 'private', id: '9999999' }, schedule: { type: 'daily', time: '07:00' }, exec: 'echo pwn' },
 ]));
 
 const B = require(path.join(BASE, 'bridge.js'));
@@ -81,8 +83,11 @@ const ok = (name, pass, extra = '') => {
 
 // ---- tasks.json 加载校验 (以前是直接赋值, 白名单外的任务会被执行)
 ok('tasks.json 里的合法任务被加载', B.TASKS.some((t) => t.id === 'tj'), JSON.stringify(B.TASKS.map((t) => t.id)));
+// 回归: 落盘后的 target 是对象, 只认字符串会把所有任务丢掉
+ok('tasks.json 的对象形式 target 被接受', B.TASKS.some((t) => t.id === 'tobj'), JSON.stringify(B.TASKS.map((t) => t.id)));
+ok('对象 target 还原成 type/id', JSON.stringify(B.TASKS.find((t) => t.id === 'tobj').target) === '{"type":"group","id":"10001"}');
 ok('tasks.json 里白名单外的任务被丢弃', !B.TASKS.some((t) => t.id === 'tbad'));
-ok('tasks.json 只留下合法的那条', B.TASKS.length === 1, `count=${B.TASKS.length}`);
+ok('tasks.json 只留下合法的两条', B.TASKS.length === 2, `count=${B.TASKS.length}`);
 B.TASKS.length = 0;   // 后面的用例假设 TASKS 从空开始
 
 // ---- 时间解析
