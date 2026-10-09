@@ -1010,6 +1010,12 @@ class PiSession {
         const msgs = rec.messages || [];
         const last = msgs[msgs.length - 1];
         const reason = last && last.stopReason;
+        // 空回复的成因签名: 整段回答被上游算进了思考通道 (output == reasoning, 正文为空)。
+        // 2026-10-09 实测: cobblemon/deepseek-v4.1-flash 1696 轮里 18 次空回复,
+        // 18 次都是这个签名; 同期 workbuddy/deepseek 445 轮 0 次。是上游的毛病。
+        // 知道这个才能给出「换个模型」这种真能解决问题的建议, 而不是泛泛地说「再试一次」。
+        const u = (last && last.usage) || {};
+        this.lastEmptyWasAllReasoning = u.output > 0 && u.output === u.reasoning;
         // 这一轮已经产出最终回答了 (stop / length), 但 pi 可能还要再发 agent_settled。
         // 实测这中间能隔好几分钟 —— 期间如果只等 settled 才 flush, 用户就一直看不到
         // 已经生成好的回复。所以这里先强制发一次, settled 那次再发就是空操作。
@@ -1061,8 +1067,10 @@ class PiSession {
             }, 500);
           } else {
             this.emptyRetries = 0;
-            this.sendQQ('⚠️ 连续两次都是空回复（上游没返回正文）。'
-              + '可以再试一次，或者用 /compact 压缩上下文、/new 开新会话、/model 换个模型。',
+            const hint = this.lastEmptyWasAllReasoning
+              ? '这次是模型把整段回答写进了思考通道、正文为空（上游的老毛病），换个模型通常立刻就好。'
+              : '可以再试一次，或者用 /compact 压缩上下文、/new 开新会话、/model 换个模型。';
+            this.sendQQ(`⚠️ 连续两次都是空回复（上游没返回正文）。${hint}`,
               { plain: true }).catch(() => {});
           }
         } else if (this.turnHadOutput) {
