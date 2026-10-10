@@ -161,8 +161,13 @@ const ok = (name, pass, extra) => { results.push({ name, pass }); console.log(`$
   // ---- SSRF 兜底: 内网地址必须被拒 (原来入站下载完全不校验目标)
   {
     const priv = ['127.0.0.1', '10.0.0.5', '192.168.1.1', '172.16.3.4', '169.254.169.254',
-      'localhost', 'foo.localhost', '::1', '0.0.0.0', '100.64.0.1'];
-    const pub = ['example.com', '8.8.8.8', '1.1.1.1', '223.5.5.5', '172.32.0.1', '192.169.0.1'];
+      'localhost', 'foo.localhost', '::1', '0.0.0.0', '100.64.0.1',
+      // IPv4-mapped IPv6: new URL 会把它归一化成 ::ffff:7f00:1 这种形式
+      '::ffff:127.0.0.1', '::ffff:7f00:1', '::ffff:a00:1', '::ffff:a9fe:a9fe',
+      'fc00::1', 'fe80::1'];
+    const pub = ['example.com', '8.8.8.8', '1.1.1.1', '223.5.5.5', '172.32.0.1', '192.169.0.1',
+      // 这两个以前会被 /^f[cd]/ 误判成内网
+      'fda.gov', 'fc2.com', '::ffff:8.8.8.8'];
     const badPriv = priv.filter((h) => !B.isPrivateHost(h));
     const badPub = pub.filter((h) => B.isPrivateHost(h));
     ok('内网地址被拒', badPriv.length === 0, `漏了: ${badPriv.join(',')}`);
@@ -170,6 +175,8 @@ const ok = (name, pass, extra) => { results.push({ name, pass }); console.log(`$
     ok('非 http(s) 协议被拒', B.safeFetchUrl('file:///etc/passwd') === null);
     ok('内网 URL 被拒', B.safeFetchUrl('http://127.0.0.1:3001/x') === null);
     ok('公网 URL 放行', B.safeFetchUrl('https://example.com/a') !== null);
+    ok('mapped IPv6 URL 被拒', B.safeFetchUrl('http://[::ffff:127.0.0.1]:3001/x') === null);
+    ok('十进制 IP URL 被拒', B.safeFetchUrl('http://2130706433/') === null);
   }
 
   // ---- toContainerPath: 宿主 outbox 路径要映射成容器路径

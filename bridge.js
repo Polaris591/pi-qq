@@ -1608,8 +1608,12 @@ async function getSession(target) {
           // 淘汰前把缓冲区里已生成、还没发出去的内容 flush 掉, 否则用户会
           // 静默丢掉半截回复。flush 失败也不能拦住淘汰流程。
           await oldest.flush(true).catch((e) => warn(`[${oldest.key}] LRU 淘汰前 flush 失败: ${e.message}`));
-          sessions.delete(oldest.key);
-          await oldest.destroy('LRU');
+          // flush 有 await, 这期间该会话可能已被空闲巡检回收、同一个 key 又被
+          // 新消息占上。直接 delete 会删掉新实例(它的 pi 子进程就成孤儿了)。
+          if (sessions.get(oldest.key) === oldest) {
+            sessions.delete(oldest.key);
+            await oldest.destroy('LRU');
+          }
         }
       }
       const ns = new PiSession(key, target);
@@ -1714,15 +1718,21 @@ function watchdogSeen() {
 }
 
 const HEARTBEAT_TIMEOUT_MS = Math.max(0, Number(cfg.behavior.heartbeatTimeoutMs) || 0);
+// 心跳自愈的冷却时间戳: 假死 NapCat 上重启桥接治不了根, 没有冷却会变成
+// 每 7.5 分钟一轮的重启循环。
+let lastHeartbeatHealAt = 0;
 if (HEARTBEAT_TIMEOUT_MS) {
   const wdTimer = setInterval(() => {
     if (!onebot.ws || onebot.ws.readyState !== WebSocket.OPEN) return;
     const idle = Date.now() - lastSeenAt;
     if (idle > HEARTBEAT_TIMEOUT_MS) qqOffline(`心跳超时 ${Math.round(idle / 1000)}s 无任何上报`, 'timeout');
-    // 假死的 NapCat 会保持 socket OPEN, self-heal 那边判不出来 —— 这里给心跳
-    // 也加一条自愈: 持续到 5 倍阈值仍无任何上报, 就交给 systemd 重启。
-    if (idle > HEARTBEAT_TIMEOUT_MS * 5) {
-      fatal('heartbeat-dead', new Error(`心跳超时 ${Math.round(idle / 1000)}s (阈值的 5 倍), 触发重启`));
+    // 假死的 NapCat 会保持 socket OPEN, self-heal 那边判不出来 —— 这里补一条
+    // 自愈路径。写 markRestart 是为了让新进程能发「重启完成」提示, 而不是让
+    // 用户看到一次无解释的静默重启。
+    if (idle > HEARTBEAT_TIMEOUT_MS * 5 && Date.now() - lastHeartbeatHealAt > 60 * 60 * 1000) {
+      lastHeartbeatHealAt = Date.now();
+      markRestart('heartbeat-dead');
+      fatal('heartbeat-dead', new Error(`心跳超时 ${Math.round(idle / 1000)}s (阈值的 5 倍), 触发自愈重启`));
     }
   }, 30000);
   wdTimer.unref();
@@ -2503,6 +2513,10 @@ function runShell(cmd, timeoutMs) {
         LANG: process.env.LANG || 'C.UTF-8',
         TZ: process.env.TZ || 'Asia/Shanghai',
       };
+      // 常见脚本会读的这几个, 有就带上(不塞空值, 免得脚本误判成已设置)
+      for (const k of ['USER', 'LOGNAME', 'SHELL', 'TERM', 'SSH_AUTH_SOCK']) {
+        if (process.env[k]) safeEnv[k] = process.env[k];
+      }
       child = spawn('/bin/bash', ['-lc', cmd], { cwd: cfg.pi.cwd, env: safeEnv });
     } catch (e) { finish({ code: -1, out: '', err: String(e.message || e) }); return; }
     const timer = setTimeout(() => {
@@ -2581,8 +2595,11 @@ async function runTask(t) {
   // 只看 busy 会把「刚握完手就崩掉」误判成完成: 消息还在 queue 里、busy 为假,
   // 3 秒后就按「任务完成」销毁会话, 用户那边什么提示都没有。
   const iv = setInterval(() => {
-    if (!ps.closed && ps.proc === null && ps.queue.length) {
-      finish('task crashed', `❌ 定时任务「${label}」执行中断（pi 进程退出，消息未被处理）`);
+    // 任务会话的 pi 一旦退出, 本轮 prompt 就丢了(respawn 不会重放已派发的消息),
+    // 必须报中断, 否则要等到 30 分钟 deadline 才说话。prompt 是直接派发的,
+    // 消息不进 queue, 所以不能靠 queue.length 判断(那样这个分支永远不成立)。
+    if (!ps.closed && ps.proc === null) {
+      finish('task crashed', `❌ 定时任务「${label}」执行中断（pi 进程退出）`);
       return;
     }
     if (!ps.busy && !ps.isWorking() && !ps.queue.length) finish('task done');
@@ -2622,7 +2639,8 @@ async function tickTasks() {
     if (t.nextRun > now) continue;
     // 上一轮还没跑完就跳过本轮, 等它结束再说
     if (TASK_INFLIGHT.has(t.id)) {
-      warn(`任务 ${t.id} 上一轮还在跑, 本轮跳过`);
+      // 长任务每 20s 巡检一次, 用带去重的告警, 否则 30 分钟的任务会刷 90 行日志
+      warnTaskFileOnce(`taskinflight:${t.id}`, `任务 ${t.id} 上一轮还在跑, 本轮跳过`);
       continue;
     }
     const missed = now - t.nextRun;
@@ -2794,20 +2812,25 @@ async function parseCards(cards, depth = 0) {
       // 卡片文本要有上限: 转发正文限 300 字、引用限 500 字, 卡片原先不限,
       // 一条超大卡片就能把上下文灌满。
       const lines = [title, desc].filter(Boolean).map((x) => String(x).trim().slice(0, 300));
-      if (url) lines.push(String(url).slice(0, 500));
+      // URL 不能截断 —— 截了就是个打不开的链接。超长的整条丢掉。
+      if (url) {
+        const u = String(url).trim();
+        if (u.length <= 2000) lines.push(u);
+      }
       if (lines.length) { out.push(['【卡片】', ...lines].join('\n')); continue; }
     }
 
     // ---- XML 卡片: 抠出常见的几个标签
     const pick = (tag) => {
       const m = new RegExp(`<${tag}[^>]*>([\\s\\S]*?)</${tag}>`, 'i').exec(raw);
-      return m ? m[1].replace(/<!\[CDATA\[|\]\]>/g, '').trim().slice(0, 300) : '';
+      return m ? m[1].replace(/<!\[CDATA\[|\]\]>/g, '').trim() : '';
     };
-    const title = pick('title');
-    const desc = pick('des') || pick('summary');
+    const title = pick('title').slice(0, 300);
+    const desc = (pick('des') || pick('summary')).slice(0, 300);
     const url = pick('url');
     const lines = [title, desc].filter(Boolean);
-    if (url && /^https?:/i.test(url)) lines.push(url);
+    // URL 不截断, 超长的整条丢掉
+    if (url && url.length <= 2000 && /^https?:/i.test(url)) lines.push(url);
     if (lines.length) out.push(['【卡片】', ...lines].join('\n'));
   }
 
@@ -2831,7 +2854,8 @@ function forwardBudgetOk(key) {
 
 async function fetchForwardContent(resid, depth = 0) {
   if (!resid || depth > 2) return '';
-  if (!forwardBudgetOk(String(resid))) return '';
+  // 命中预算/重复时给占位文字而不是空串 —— 空串会让这段转发内容静默消失
+  if (!forwardBudgetOk(String(resid))) return '[转发内容过多或重复，已省略]';
   let msgs = [];
   try {
     const r = await onebot.action('get_forward_msg', { id: String(resid) }, 10000);
@@ -3597,7 +3621,19 @@ function isPrivateHost(hostname) {
   const h = String(hostname || '').toLowerCase().replace(/^\[|\]$/g, '');
   if (!h) return true;
   if (h === 'localhost' || h.endsWith('.localhost')) return true;
-  if (h === '::1' || h === '::' || /^fe80:/i.test(h) || /^f[cd]/i.test(h)) return true;
+  if (h === '::1' || h === '::') return true;
+  // IPv6 前缀必须带冒号: fe80::/10 是链路本地, fc00::/7 是 ULA。
+  // 原来写成 /^f[cd]/ 会把 fda.gov / fc2.com 这类公网域名误判成内网。
+  if (/^fe80:/i.test(h) || /^f[cd][0-9a-f]{0,2}:/i.test(h)) return true;
+  // IPv4-mapped IPv6: new URL 会把 [::ffff:127.0.0.1] 归一化成 ::ffff:7f00:1,
+  // 不认这种形式的话 https://[::ffff:127.0.0.1]/ 就直接绕过内网拦截。
+  const m6 = /^::ffff:([0-9a-f]{1,4}):([0-9a-f]{1,4})$/.exec(h);
+  if (m6) {
+    const hi = parseInt(m6[1], 16), lo = parseInt(m6[2], 16);
+    return isPrivateHost(`${(hi >> 8) & 255}.${hi & 255}.${(lo >> 8) & 255}.${lo & 255}`);
+  }
+  const m4 = /^::ffff:(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})$/.exec(h);
+  if (m4) return isPrivateHost(m4[1]);
   const m = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(h);
   if (!m) return false;
   const a = Number(m[1]), b = Number(m[2]);
@@ -3795,6 +3831,11 @@ async function sweepOutbox() {
   try {
     const items = [];
     collectOutbox(OUTBOX_HOST, OUTBOX_HOST, items, 0);
+    // 触顶通常意味着有文件一直发不出去, 新文件于是完全进不了 items。
+    // 不说一声的话, 用户看到的就是「文件放进去没反应」。
+    if (items.length >= OUTBOX_MAX_ITEMS) {
+      warnTaskFileOnce('outbox:full', `outbox 条目已达上限 ${OUTBOX_MAX_ITEMS}, 超出的文件本轮不处理`);
+    }
     for (const it of items) {
       let st;
       try { st = fs.statSync(it.full); } catch { continue; }
@@ -4042,10 +4083,11 @@ process.on('uncaughtException', (e) => fatal('uncaughtException', e));
 function start() {
   // 重复调用 start() 会让新旧 timer 并存, 同一个任务被触发两次。
   // 先把可能残留的旧 timer 清掉。
-  for (const t of [outboxTimer, taskTimer, storageTimer, selfHealTimer, watchdogTimer, turnTimer, silenceTimer]) {
+  for (const t of [outboxTimer, taskTimer, storageTimer, selfHealTimer, watchdogTimer, turnTimer, silenceTimer, restartTimer]) {
     if (t) clearInterval(t);
   }
   outboxTimer = taskTimer = storageTimer = selfHealTimer = watchdogTimer = null;
+  restartTimer = null;
   migrateMemoryLayout();
   onebot.connect();
 
