@@ -3742,6 +3742,9 @@ function downloadToFile(url, dest, depth = 0) {
         res.resume();
         // 重定向每跳重新校验, 防止公网地址 302 到内网
         if (!safeFetchUrl(res.headers.location, u)) return fail(new Error('重定向目标不被允许'));
+        // 这一层把 dest 的写入权交给下一层: 置 done 之后, 外层即使再收到
+        // timeout/error 也不会 unlink 下一层刚写好的文件(那时调用方已 resolve)。
+        done = true;
         return downloadToFile(new URL(res.headers.location, u).toString(), dest, depth + 1).then(resolve, reject);
       }
       if (res.statusCode !== 200) { res.resume(); return fail(new Error(`HTTP ${res.statusCode}`)); }
