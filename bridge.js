@@ -285,8 +285,15 @@ try {
 
 function saveState() {
   try {
-    fs.writeFileSync(`${STATE_PATH}.tmp`, `${JSON.stringify(STATE, null, 2)}\n`);
-    fs.renameSync(`${STATE_PATH}.tmp`, STATE_PATH);
+    const tmp = `${STATE_PATH}.tmp`;
+    // rename 只保证「目录项切换」原子, 数据页没落盘时崩溃会留下 0 字节或旧内容。
+    // 写完显式 fsync 一次, 代价是一个 syscall, 换断电后状态文件可用。
+    const fd = fs.openSync(tmp, 'w');
+    try {
+      fs.writeFileSync(fd, `${JSON.stringify(STATE, null, 2)}\n`);
+      fs.fsyncSync(fd);
+    } finally { fs.closeSync(fd); }
+    fs.renameSync(tmp, STATE_PATH);
   } catch (e) { warn('保存状态失败:', e.message); }
 }
 
@@ -489,10 +496,25 @@ function splitForQQ(text, limit) {
     const a = s.charCodeAt(i - 1), b = s.charCodeAt(i);
     return a >= 0xd800 && a <= 0xdbff && b >= 0xdc00 && b <= 0xdfff;
   };
-  /** 把切点挪到合法位置 (避开代理对内部) */
+  // 除了代理对, ZWJ 连字 (👨‍👩‍👧) 和组合符 (e + U+0301) 也不能从中间切开:
+  // 只判代理对的话, 切点落在 ZWJ 两侧照样会把一个字素簇拆成两段乱码。
+  const ZWJ = 0x200d;
+  const isCombining = (c) => (c >= 0x0300 && c <= 0x036f) || (c >= 0x1ab0 && c <= 0x1aff)
+    || (c >= 0x20d0 && c <= 0x20ff) || (c >= 0xfe20 && c <= 0xfe2f);
+  const badCut = (s, i) => {
+    if (i <= 0 || i >= s.length) return false;
+    if (splitsSurrogate(s, i)) return true;
+    const before = s.charCodeAt(i - 1), after = s.charCodeAt(i);
+    if (before === ZWJ || after === ZWJ) return true;
+    if (isCombining(after)) return true;
+    if (after >= 0xfe00 && after <= 0xfe0f) return true;   // 变体选择符
+    return false;
+  };
+  /** 把切点往前挪到合法位置 (最多退 8 格, 避免病态输入空转) */
   const safeCut = (s, i) => {
-    if (splitsSurrogate(s, i)) return i - 1;   // 退一格, 把整个 emoji 留给下一段
-    return i;
+    let n = 0;
+    while (badCut(s, i) && n < 8) { i--; n++; }
+    return i > 0 ? i : 0;
   };
 
   while (rest.length > limit) {
@@ -532,6 +554,9 @@ function stripInlineMd(s) {
     .replace(/__([^_]+)__/g, '$1')
     .replace(/(^|[^*\w])\*([^*\n]+)\*(?=[^*\w]|$)/g, '$1$2')
     .replace(/(^|[^_\w])_([^_\n]+)_(?=[^_\w]|$)/g, '$1$2')
+    // 斜体剥离可能吃掉内层星号、把外层的 ** 露出来 (如 **重点*注意***),
+    // 这里补跑一遍粗体规则, 否则用户会看到残留的 **
+    .replace(/\*\*([^*]+)\*\*/g, '$1')
     // 删除线 ~~x~~ -> x
     .replace(/~~([^~]+)~~/g, '$1')
     // 链接 [文字](url) -> 文字 (url)
@@ -635,7 +660,7 @@ class PiSession {
     this.busy = false;
     this.queue = [];
     this.maxQueue = Math.max(1, Number(cfg.behavior.maxQueue) || 5);
-    this.lastQueueWarn = 0;    this.queueWarnAt = new Map();   // 每个发言人上次收到排队提示的时间 (避免刷屏)
+    this.queueWarnAt = new Map();   // 每个发言人上次收到排队提示的时间 (避免刷屏)
     this.lastFlush = Date.now();
     this.lastUsed = Date.now();
     this.flushTimer = null;
@@ -863,7 +888,7 @@ class PiSession {
     if (n === 3) {
       // 只提醒一次, 避免刷屏
       this.sendQQ(`⚠️ pi 连续 ${n} 次启动失败（${why}），我会继续重试但间隔会拉长。`,
-        { plain: true }).catch(() => {});
+        { plain: true }).catch((e) => warn(`发送提示失败: ${e.message}`));
     }
     if (this.respawnTimer) clearTimeout(this.respawnTimer);
     this.respawnTimer = setTimeout(() => {
@@ -923,7 +948,7 @@ class PiSession {
           if (t.unref) t.unref();
         } else {
           this.rejectRequeues = 0;
-          this.sendQQ(`❌ 这条消息没能跑起来：${msg}`, { plain: true }).catch(() => {});
+          this.sendQQ(`❌ 这条消息没能跑起来：${msg}`, { plain: true }).catch((e) => warn(`发送提示失败: ${e.message}`));
         }
       }
       // 顺序很重要: 先 busy=false 再 drain, 否则队列永远排不出去
@@ -932,7 +957,7 @@ class PiSession {
       return;
     }
     if (cmd === 'steer') {
-      this.sendQQ(`⚠️ 插话没生效：${msg}`, { plain: true }).catch(() => {});
+      this.sendQQ(`⚠️ 插话没生效：${msg}`, { plain: true }).catch((e) => warn(`发送提示失败: ${e.message}`));
       return;
     }
     // 其余命令(compact / new_session / set_model …)都由 request() 等着响应,
@@ -978,7 +1003,7 @@ class PiSession {
             this.abortRequested = true;
             this.send({ type: 'abort', id: `abort-think-${Date.now()}` });
             this.sendQQ('⚠️ 模型陷入重复循环（上游工具调用格式异常），我把它中断了。重发一次通常就好。',
-              { plain: true }).catch(() => {});
+              { plain: true }).catch((e) => warn(`发送提示失败: ${e.message}`));
           }
         } else if (ev.type === 'text_delta' && ev.delta) {
           this.phase = 'writing';
@@ -1002,7 +1027,7 @@ class PiSession {
           if (!tooSoon) {
             this.lastToolNoticeAt = now;
             this.flush(true).catch((e) => warn(`[${this.key}] flush 失败: ${e.message}`));
-            this.sendQQ(describeToolCall(rec.toolName, rec.args), { plain: true }).catch(() => {});
+            this.sendQQ(describeToolCall(rec.toolName, rec.args), { plain: true }).catch((e) => warn(`发送提示失败: ${e.message}`));
           }
         }
         break;
@@ -1041,7 +1066,7 @@ class PiSession {
           const tail = this.stderrTail.join('').trim().split('\n').slice(-4).join('\n');
           // 不用 ``` 围栏: QQ 不渲染 Markdown, 三个反引号会原样露出来
           const body = tail ? `\n${mdToPlain(tail)}` : '';
-          this.sendQQ(`❌ 模型调用失败${body}`, { plain: true }).catch(() => {});
+          this.sendQQ(`❌ 模型调用失败${body}`, { plain: true }).catch((e) => warn(`发送提示失败: ${e.message}`));
         }
         break;
       }
@@ -1083,7 +1108,7 @@ class PiSession {
               ? '这次是模型把整段回答写进了思考通道、正文为空（上游的老毛病），换个模型通常立刻就好。'
               : '可以再试一次，或者用 /compact 压缩上下文、/new 开新会话、/model 换个模型。';
             this.sendQQ(`⚠️ 连续两次都是空回复（上游没返回正文）。${hint}`,
-              { plain: true }).catch(() => {});
+              { plain: true }).catch((e) => warn(`发送提示失败: ${e.message}`));
           }
         } else if (this.turnHadOutput) {
           this.emptyRetries = 0;   // 正常出话就清零
@@ -1294,7 +1319,7 @@ class PiSession {
             this.queueWarnAt.delete(this.queueWarnAt.keys().next().value);
           }
         }
-        this.sendQQ(msg, { plain: true, ...(ctx && ctx.userId ? { atUser: ctx.userId } : {}) }).catch(() => {});
+        this.sendQQ(msg, { plain: true, ...(ctx && ctx.userId ? { atUser: ctx.userId } : {}) }).catch((e) => warn(`发送提示失败: ${e.message}`));
       };
       if (this.queue.length >= this.maxQueue) {
         warnOnce('full', `⚠️ 排队已满（${this.maxQueue} 条），这条被忽略了，等前面跑完再发。`);
@@ -1491,6 +1516,24 @@ const taskSessions = new Set();
 const creatingSessions = new Map();
 
 /** 直接给某个 target 发一条纯文本 (不经过会话, 用于告警/通知) */
+/**
+ * 静默提醒的判定。抽成纯函数是为了能单测 —— 这段逻辑原来埋在 setInterval 里,
+ * 测试只能自己重算一遍算术, 改坏了照样绿。
+ * 返回 null 表示不该提醒; 否则返回已经静默的毫秒数。
+ */
+function silenceDue(s, now, silenceMs, maxNotices) {
+  // busy = 正在跑一轮 prompt; workLabel = 正在跑一个耗时的非 prompt 操作
+  if (!s.busy && !s.workLabel) return null;
+  const idle = now - (s.lastOutputAt || s.lastEventAt || now);
+  if (idle < silenceMs) return null;
+  const sent = s.silenceNotices || 0;
+  if (sent >= maxNotices) return null;
+  // 提醒间隔逐次拉长 (45s/90s/135s…), 否则长任务会被同一条消息刷屏
+  const need = silenceMs * (sent + 1);
+  if (now - (s.lastSilenceNoticeAt || 0) < need) return null;
+  return idle;
+}
+
 async function notifyTarget(target, text) {
   if (!target || !text) return false;
   try {
@@ -1551,15 +1594,23 @@ async function getSession(target) {
         await cur.destroy('pi 已退出').catch((e) => warn(`[${key}] 清理死会话失败: ${e.message}`));
       }
       if (sessions.size >= cfg.behavior.maxSessions) {
-        // LRU 淘汰: 优先闲置会话; 全部忙碌时也淘汰最久未用的一个, 否则会话数会无限增长
+        // LRU 淘汰: 优先闲置会话; 全部忙碌时也淘汰最久未用的一个, 否则会话数会无限增长。
+        // 用 isWorking() 而不是 busy: /compact 这类操作只置 workLabel, 只判 busy
+        // 会把正在压缩上下文的会话当成最闲置的那个。
         let oldest = null;
         for (const [, v] of sessions) {
           if (!oldest) { oldest = v; continue; }
-          const better = (oldest.busy && !v.busy)
-            || (oldest.busy === v.busy && v.lastUsed < oldest.lastUsed);
+          const better = (oldest.isWorking() && !v.isWorking())
+            || (oldest.isWorking() === v.isWorking() && v.lastUsed < oldest.lastUsed);
           if (better) oldest = v;
         }
-        if (oldest) { sessions.delete(oldest.key); await oldest.destroy('LRU'); }
+        if (oldest) {
+          // 淘汰前把缓冲区里已生成、还没发出去的内容 flush 掉, 否则用户会
+          // 静默丢掉半截回复。flush 失败也不能拦住淘汰流程。
+          await oldest.flush(true).catch((e) => warn(`[${oldest.key}] LRU 淘汰前 flush 失败: ${e.message}`));
+          sessions.delete(oldest.key);
+          await oldest.destroy('LRU');
+        }
       }
       const ns = new PiSession(key, target);
       sessions.set(key, ns);
@@ -1668,6 +1719,11 @@ if (HEARTBEAT_TIMEOUT_MS) {
     if (!onebot.ws || onebot.ws.readyState !== WebSocket.OPEN) return;
     const idle = Date.now() - lastSeenAt;
     if (idle > HEARTBEAT_TIMEOUT_MS) qqOffline(`心跳超时 ${Math.round(idle / 1000)}s 无任何上报`, 'timeout');
+    // 假死的 NapCat 会保持 socket OPEN, self-heal 那边判不出来 —— 这里给心跳
+    // 也加一条自愈: 持续到 5 倍阈值仍无任何上报, 就交给 systemd 重启。
+    if (idle > HEARTBEAT_TIMEOUT_MS * 5) {
+      fatal('heartbeat-dead', new Error(`心跳超时 ${Math.round(idle / 1000)}s (阈值的 5 倍), 触发重启`));
+    }
   }, 30000);
   wdTimer.unref();
 }
@@ -1715,11 +1771,11 @@ const onebot = {
             // 否则「到底发没发」只能去翻 NapCat 的日志, 排查时很别扭。
             log(`启动通知已发出: ${notice.split('\n')[0]}`);
             for (const id of PRIVATE_ALLOW) {
-              this.action('send_private_msg', { user_id: Number(id), message: notice }).catch(() => {});
+              this.action('send_private_msg', { user_id: Number(id), message: notice }).catch((e) => warn(`发送提示失败: ${e.message}`));
             }
           }
         }
-      }).catch(() => {});
+      }).catch((e) => warn(`发送提示失败: ${e.message}`));
     });
 
     ws.on('message', (data) => this.handleWsMessage(data));
@@ -2128,6 +2184,9 @@ function migrateMemoryLayout() {
 // ---------------------------------------------------------------- 定时任务
 
 const TASK_PATH = path.join(STATE_DIR, 'tasks.json');
+// 正在执行的任务 id。触发瞬间 nextRun 已经前移, 没有这个集合的话, 单次执行
+// 超过调度间隔的任务会被重复触发 (同一 target 并发多个会话、重复推 QQ)。
+const TASK_INFLIGHT = new Set();
 let TASKS = [];
 try {
   const rawTasks = JSON.parse(fs.readFileSync(TASK_PATH, 'utf8'));
@@ -2296,8 +2355,11 @@ function nextRunAt(task, from = Date.now()) {
 /** 任务目标是否在允许范围内 */
 function taskTargetAllowed(target) {
   if (!target) return false;
-  if (target.type === 'group') return GROUP_ALLOW.size ? GROUP_ALLOW.has(String(target.id)) : !!cfg.access.allowAllGroups;
-  return PRIVATE_ALLOW.size ? PRIVATE_ALLOW.has(String(target.id)) : !!cfg.access.allowAllPrivate;
+  // 任务会长期自动执行并把输出发到 target, 所以这里只认显式白名单, 不受
+  // allowAllPrivate / allowAllGroups 影响 —— 否则一旦开了 allowAll, 一条被
+  // 注入的任务就能把输出发到任意 QQ 号。
+  if (target.type === 'group') return GROUP_ALLOW.has(String(target.id));
+  return PRIVATE_ALLOW.has(String(target.id));
 }
 
 /** 校验一条外部任务定义, 返回归一化后的任务或 null */
@@ -2372,6 +2434,11 @@ function mergeTaskFiles() {
       if (!t) { bad++; continue; }
       const idx = TASKS.findIndex((x) => x.id === t.id);
       if (idx >= 0) {
+        // 同 id 来自不同文件 => 后者覆盖前者, 两个文件都会被删掉。必须告警,
+        // 否则用户以为两条任务都在, 实际只剩一条。
+        if (TASKS[idx].source && TASKS[idx].source !== f) {
+          warnTaskFileOnce(`taskdup:${t.id}:${f}`, `任务 id 冲突: ${t.id} 同时出现在 ${TASKS[idx].source} 和 ${f}, 后者覆盖前者`);
+        }
         // 保留运行记录, 其余字段以文件为准
         const keep = { lastRun: TASKS[idx].lastRun, nextRun: TASKS[idx].nextRun, createdAt: TASKS[idx].createdAt };
         TASKS[idx] = { ...t, ...keep };
@@ -2428,7 +2495,15 @@ function runShell(cmd, timeoutMs) {
     const finish = (r) => { if (!done) { done = true; resolve(r); } };
     let child;
     try {
-      child = spawn('/bin/bash', ['-lc', cmd], { cwd: cfg.pi.cwd, env: process.env });
+      // 只传必要变量。全量 process.env 会把 systemd EnvironmentFile 里的密钥/
+      // 令牌一并交给任务脚本, 而任务脚本可能是被诱导写下的。
+      const safeEnv = {
+        PATH: process.env.PATH || '/usr/local/bin:/usr/bin:/bin',
+        HOME: process.env.HOME || '/root',
+        LANG: process.env.LANG || 'C.UTF-8',
+        TZ: process.env.TZ || 'Asia/Shanghai',
+      };
+      child = spawn('/bin/bash', ['-lc', cmd], { cwd: cfg.pi.cwd, env: safeEnv });
     } catch (e) { finish({ code: -1, out: '', err: String(e.message || e) }); return; }
     const timer = setTimeout(() => {
       try { child.kill('SIGKILL'); } catch { /* 已经退了 */ }
@@ -2458,31 +2533,36 @@ async function runTask(t) {
       if (r.code !== 0) {
         const tail = String(r.err || '').trim().split('\n').slice(-5).join('\n');
         warn(`任务 ${t.id} 退出码 ${r.code} 且无输出`);
-        notifyTarget(target, `❌ 定时任务「${label}」执行失败（退出码 ${r.code}）${tail ? `\n${mdToPlain(tail)}` : ''}`).catch(() => {});
+        notifyTarget(target, `❌ 定时任务「${label}」执行失败（退出码 ${r.code}）${tail ? `\n${mdToPlain(tail)}` : ''}`).catch((e) => warn(`发送提示失败: ${e.message}`));
       } else {
         log(`任务 ${t.id} 无输出, 静默结束`);
       }
       return;
     }
-    notifyTarget(target, body).catch(() => {});
+    notifyTarget(target, body).catch((e) => warn(`发送提示失败: ${e.message}`));
     return;
   }
   if (!cfg.behavior.quietNotices) {
-    notifyTarget(target, `⏰ 定时任务「${label}」执行中…`).catch(() => {});
+    notifyTarget(target, `⏰ 定时任务「${label}」执行中…`).catch((e) => warn(`发送提示失败: ${e.message}`));
   }
 
   // 任务跑在独立会话里, 不污染用户当前对话的上下文
   const ps = new PiSession(key, target, { ephemeral: true });
   // 登记进「在忙」统计: 定时任务跑的时候重启要等它
   taskSessions.add(ps);
+  // ready() 期间 busy 与 workLabel 都还是空的, busySessionCount 会把这段
+  // (最长 15s 的握手窗口) 当成空闲 —— 期间 /restart 会把刚启动的任务砍掉。
+  ps.workLabel = '任务启动中';
   try {
     await ps.ready();
+    ps.workLabel = '';
     ps.prompt(t.prompt, [], { replyTo: null, atUser: null });
   } catch (e) {
+    ps.workLabel = '';
     warn(`任务 ${t.id} 启动失败: ${e.message}`);
     taskSessions.delete(ps);
     await ps.destroy('task failed');
-    notifyTarget(target, `❌ 定时任务「${label}」启动失败: ${e.message}`).catch(() => {});
+    notifyTarget(target, `❌ 定时任务「${label}」启动失败: ${e.message}`).catch((e) => warn(`发送提示失败: ${e.message}`));
     return;
   }
 
@@ -2495,17 +2575,24 @@ async function runTask(t) {
     clearTimeout(deadline);
     taskSessions.delete(ps);
     await ps.destroy(why);
-    if (errNote) notifyTarget(target, errNote).catch(() => {});
+    if (errNote) notifyTarget(target, errNote).catch((e) => warn(`发送提示失败: ${e.message}`));
   };
 
-  const iv = setInterval(() => { if (!ps.busy) finish('task done'); }, 3000);
+  // 只看 busy 会把「刚握完手就崩掉」误判成完成: 消息还在 queue 里、busy 为假,
+  // 3 秒后就按「任务完成」销毁会话, 用户那边什么提示都没有。
+  const iv = setInterval(() => {
+    if (!ps.closed && ps.proc === null && ps.queue.length) {
+      finish('task crashed', `❌ 定时任务「${label}」执行中断（pi 进程退出，消息未被处理）`);
+      return;
+    }
+    if (!ps.busy && !ps.isWorking() && !ps.queue.length) finish('task done');
+  }, 3000);
   iv.unref();
   const deadline = setTimeout(() => finish('task timeout',
     `⏰ 定时任务「${label}」超时了（超过 30 分钟），已中止。可以把它拆小一点。`), 30 * 60 * 1000);
   deadline.unref();
 
   // 失败要主动告知: 任务在后台跑, 用户看不到日志, 不通知就等于悄悄不工作了
-  ps.taskError = null;
   ps.onTaskError = (reason) => {
     const tail = ps.stderrTail.join('').trim().split('\n').slice(-3).join('\n');
     const body = tail ? `\n${mdToPlain(tail)}` : '';
@@ -2533,6 +2620,11 @@ async function tickTasks() {
       continue;
     }
     if (t.nextRun > now) continue;
+    // 上一轮还没跑完就跳过本轮, 等它结束再说
+    if (TASK_INFLIGHT.has(t.id)) {
+      warn(`任务 ${t.id} 上一轮还在跑, 本轮跳过`);
+      continue;
+    }
     const missed = now - t.nextRun;
     t.lastRun = t.nextRun;
     t.nextRun = nextRunAt({ ...t, lastRun: t.lastRun }, now);
@@ -2545,7 +2637,10 @@ async function tickTasks() {
       warn(`跳过过期任务 ${t.id} (错过 ${Math.round(missed / 60000)} 分钟)`);
       continue;
     }
-    runTask(t).catch((e) => warn(`任务 ${t.id} 执行失败: ${e.message}`));
+    TASK_INFLIGHT.add(t.id);
+    runTask(t)
+      .catch((e) => warn(`任务 ${t.id} 执行失败: ${e.message}`))
+      .finally(() => TASK_INFLIGHT.delete(t.id));
   }
   if (dirty) saveTasks();
 }
@@ -2696,15 +2791,17 @@ async function parseCards(cards, depth = 0) {
       const desc = j?.meta?.detail?.desc || j?.meta?.news?.desc || j?.desc || '';
       const url = j?.meta?.detail?.qqdocurl || j?.meta?.detail?.url
         || j?.meta?.news?.jumpUrl || j?.meta?.detail?.jumpUrl || j?.url || '';
-      const lines = [title, desc].filter(Boolean).map((x) => String(x).trim());
-      if (url) lines.push(String(url));
+      // 卡片文本要有上限: 转发正文限 300 字、引用限 500 字, 卡片原先不限,
+      // 一条超大卡片就能把上下文灌满。
+      const lines = [title, desc].filter(Boolean).map((x) => String(x).trim().slice(0, 300));
+      if (url) lines.push(String(url).slice(0, 500));
       if (lines.length) { out.push(['【卡片】', ...lines].join('\n')); continue; }
     }
 
     // ---- XML 卡片: 抠出常见的几个标签
     const pick = (tag) => {
       const m = new RegExp(`<${tag}[^>]*>([\\s\\S]*?)</${tag}>`, 'i').exec(raw);
-      return m ? m[1].replace(/<!\[CDATA\[|\]\]>/g, '').trim() : '';
+      return m ? m[1].replace(/<!\[CDATA\[|\]\]>/g, '').trim().slice(0, 300) : '';
     };
     const title = pick('title');
     const desc = pick('des') || pick('summary');
@@ -2718,8 +2815,23 @@ async function parseCards(cards, depth = 0) {
 }
 
 /** 取合并转发里的消息, 拼成可读文本 */
+// 合并转发可以互相嵌套, 每层 30 条 × 3 张卡递归下去, 理论扇出上万次 API 调用
+// (每次 10s 超时)。用「同 resid 只展开一次 + 时间窗内总量封顶」把扇出压住。
+const FORWARD_SEEN = new Map();   // resid -> at
+const FORWARD_WINDOW_MS = 5 * 60 * 1000;
+const FORWARD_MAX_PER_WINDOW = 40;
+function forwardBudgetOk(key) {
+  const now = Date.now();
+  for (const [k, t] of FORWARD_SEEN) if (now - t > FORWARD_WINDOW_MS) FORWARD_SEEN.delete(k);
+  if (FORWARD_SEEN.has(key)) return false;
+  if (FORWARD_SEEN.size >= FORWARD_MAX_PER_WINDOW) return false;
+  FORWARD_SEEN.set(key, now);
+  return true;
+}
+
 async function fetchForwardContent(resid, depth = 0) {
   if (!resid || depth > 2) return '';
+  if (!forwardBudgetOk(String(resid))) return '';
   let msgs = [];
   try {
     const r = await onebot.action('get_forward_msg', { id: String(resid) }, 10000);
@@ -2870,8 +2982,11 @@ const SEEN_MSG_TTL_MS = 10 * 60 * 1000;
 // 群上下文缓存: groupId -> { at, items }
 const GROUP_CTX_CACHE = new Map();
 function isDuplicateMessage(rec) {
-  const mid = rec && rec.message_id != null ? String(rec.message_id) : '';
-  if (!mid) return false;
+  if (!rec || rec.message_id == null) return false;
+  // 键里带会话维度: 只认 message_id 的话, 一旦 NapCat 的 id 在不同会话间不保证
+  // 全局唯一, 另一个会话的同号消息会被当成重复静默丢掉。
+  const scope = rec.group_id != null ? `g${rec.group_id}` : `u${rec.user_id != null ? rec.user_id : '?'}`;
+  const mid = `${scope}:${String(rec.message_id)}`;
   const now = Date.now();
   const prev = SEEN_MSG.get(mid);
   if (prev && now - prev < SEEN_MSG_TTL_MS) return true;
@@ -2915,6 +3030,9 @@ function describeToolCall(toolName, args) {
 }
 
 async function handleIncoming(rec) {
+  // 关停过程中不再接新活: destroy 循环 await 期间到达的消息会 spawn 新的 pi
+  // 子进程, 随后被 process.exit 遗弃成孤儿。
+  if (shuttingDown) return;
   if (rec.post_type !== 'message') return;
   // 重复上报直接丢弃 (放在最前面, 避免重复触发 pi)
   if (isDuplicateMessage(rec)) {
@@ -3474,15 +3592,43 @@ function guessMime(buf) {
   return 'image/png';
 }
 
+/** 拒绝指向本机/内网的字面地址 (SSRF 兜底; 只查字面量, 不做 DNS 解析) */
+function isPrivateHost(hostname) {
+  const h = String(hostname || '').toLowerCase().replace(/^\[|\]$/g, '');
+  if (!h) return true;
+  if (h === 'localhost' || h.endsWith('.localhost')) return true;
+  if (h === '::1' || h === '::' || /^fe80:/i.test(h) || /^f[cd]/i.test(h)) return true;
+  const m = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(h);
+  if (!m) return false;
+  const a = Number(m[1]), b = Number(m[2]);
+  if (a === 0 || a === 10 || a === 127) return true;
+  if (a === 169 && b === 254) return true;
+  if (a === 192 && b === 168) return true;
+  if (a === 172 && b >= 16 && b <= 31) return true;
+  if (a === 100 && b >= 64 && b <= 127) return true;   // CGNAT
+  return false;
+}
+
+/** 只放行 http/https 且不指向内网的地址; 非法返回 null */
+function safeFetchUrl(raw, base) {
+  let u;
+  try { u = base ? new URL(raw, base) : new URL(raw); } catch { return null; }
+  if (u.protocol !== 'http:' && u.protocol !== 'https:') return null;
+  if (isPrivateHost(u.hostname)) return null;
+  return u;
+}
+
 function fetchBinary(url, depth = 0) {
   return new Promise((resolve, reject) => {
     if (depth > 3) return reject(new Error('重定向过多'));
-    let u;
-    try { u = new URL(url); } catch { return reject(new Error('非法 URL')); }
+    const u = safeFetchUrl(url);
+    if (!u) return reject(new Error('URL 不被允许 (非 http/https 或指向内网)'));
     const mod = u.protocol === 'https:' ? require('https') : require('http');
-    const req = mod.get(url, { timeout: 15000 }, (res) => {
+    const req = mod.get(u, { timeout: 15000 }, (res) => {
       if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
         res.resume();
+        // 每一跳都重新校验: 只查第一跳的话, 公网地址 302 到 127.0.0.1 就绕过了
+        if (!safeFetchUrl(res.headers.location, u)) return reject(new Error('重定向目标不被允许'));
         return fetchBinary(new URL(res.headers.location, u).toString(), depth + 1).then(resolve, reject);
       }
       if (res.statusCode !== 200) { res.resume(); return reject(new Error(`HTTP ${res.statusCode}`)); }
@@ -3540,27 +3686,39 @@ async function deliverImage(target, hostPath, ctx = {}) {
 function downloadToFile(url, dest, depth = 0) {
   return new Promise((resolve, reject) => {
     if (depth > 3) return reject(new Error('重定向过多'));
-    let u;
-    try { u = new URL(url); } catch { return reject(new Error('非法 URL')); }
+    const u = safeFetchUrl(url);
+    if (!u) return reject(new Error('URL 不被允许 (非 http/https 或指向内网)'));
     const mod = u.protocol === 'https:' ? require('https') : require('http');
-    const req = mod.get(url, { timeout: 60000 }, (res) => {
+    let out = null;
+    let done = false;
+    // 统一的失败出口: 关连接、关写流、删掉半截文件。超时与 socket 错误也必须
+    // 走这里 —— 之前它们直接 reject, 结果 INBOX 残留半个文件、写流也不释放。
+    const fail = (e) => {
+      if (done) return;
+      done = true;
+      try { req.destroy(); } catch { /* 可能还没建立 */ }
+      try { if (out) out.destroy(); } catch { /* 已经关了 */ }
+      try { fs.unlinkSync(dest); } catch { /* 还没创建 */ }
+      reject(e);
+    };
+    const req = mod.get(u, { timeout: 60000 }, (res) => {
       if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
         res.resume();
+        // 重定向每跳重新校验, 防止公网地址 302 到内网
+        if (!safeFetchUrl(res.headers.location, u)) return fail(new Error('重定向目标不被允许'));
         return downloadToFile(new URL(res.headers.location, u).toString(), dest, depth + 1).then(resolve, reject);
       }
-      if (res.statusCode !== 200) { res.resume(); return reject(new Error(`HTTP ${res.statusCode}`)); }
-      const out = fs.createWriteStream(dest);
+      if (res.statusCode !== 200) { res.resume(); return fail(new Error(`HTTP ${res.statusCode}`)); }
+      out = fs.createWriteStream(dest);
       let size = 0;
-      let done = false;
-      const fail = (e) => { if (done) return; done = true; req.destroy(); out.destroy(); try { fs.unlinkSync(dest); } catch {} reject(e); };
       res.on('data', (c) => { size += c.length; if (size > MAX_FILE_BYTES) fail(new Error(`超过 ${cfg.behavior.maxFileMB}MB`)); });
       res.on('error', fail);
       out.on('error', fail);
       out.on('finish', () => { if (done) return; done = true; resolve(size); });
       res.pipe(out);
     });
-    req.on('timeout', () => { req.destroy(); reject(new Error('下载超时')); });
-    req.on('error', reject);
+    req.on('timeout', () => fail(new Error('下载超时')));
+    req.on('error', fail);
   });
 }
 
@@ -3615,11 +3773,15 @@ function lastActiveTarget() {
   return best ? best.target : null;
 }
 
+// outbox 每 2 秒全量同步扫一次, 条目数必须有上限 —— 否则 pi 批量写文件时
+// 这几轮 readdirSync 会把事件循环整个卡住, 会话响应跟着抖动。
+const OUTBOX_MAX_ITEMS = 2000;
 function collectOutbox(dir, base, out, depth) {
-  if (depth > 3) return;
+  if (depth > 3 || out.length >= OUTBOX_MAX_ITEMS) return;
   let entries;
   try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return; }
   for (const e of entries) {
+    if (out.length >= OUTBOX_MAX_ITEMS) return;
     if (e.name.startsWith('.')) continue;
     const full = path.join(dir, e.name);
     if (e.isDirectory()) collectOutbox(full, base, out, depth + 1);
@@ -3676,8 +3838,8 @@ async function sweepOutbox() {
           outboxSeen.set(sk, 0);
           const s = sessions.get(sessionKey(target));
           const msg = `❌ 文件 ${path.basename(it.full)} 发送失败: ${e.message}`;
-          if (s) s.sendQQ(msg, { plain: true }).catch(() => {});
-          else onebot.action('send_private_msg', { user_id: Number(target.id), message: msg }).catch(() => {});
+          if (s) s.sendQQ(msg, { plain: true }).catch((e) => warn(`发送提示失败: ${e.message}`));
+          else onebot.action('send_private_msg', { user_id: Number(target.id), message: msg }).catch((e) => warn(`发送提示失败: ${e.message}`));
         }
       }
     }
@@ -3846,7 +4008,7 @@ function maybeRestartNow() {
     warn(`重启已等待 ${Math.round(waited() / 1000)}s, 仍有 ${busy} 个会话在跑, 强制重启`);
     sendAlert(`⚠️ 重启请求已等待 ${Math.round(waited() / 1000 / 60)} 分钟，`
       + `但还有 ${busy} 个会话在跑，已强制重启。那几条消息可能没答完，需要的话重发。`)
-      .catch(() => {});
+      .catch((e) => warn(`发送提示失败: ${e.message}`));
   }
   const reason = pendingRestart.reason;
   restartScheduled = true;
@@ -3878,6 +4040,12 @@ process.on('unhandledRejection', (e) => fatal('unhandledRejection', e));
 process.on('uncaughtException', (e) => fatal('uncaughtException', e));
 
 function start() {
+  // 重复调用 start() 会让新旧 timer 并存, 同一个任务被触发两次。
+  // 先把可能残留的旧 timer 清掉。
+  for (const t of [outboxTimer, taskTimer, storageTimer, selfHealTimer, watchdogTimer, turnTimer, silenceTimer]) {
+    if (t) clearInterval(t);
+  }
+  outboxTimer = taskTimer = storageTimer = selfHealTimer = watchdogTimer = null;
   migrateMemoryLayout();
   onebot.connect();
 
@@ -3961,7 +4129,7 @@ function start() {
         // flush 是 async: 同步 try/catch 抓不到它的 rejection, 会变成
         // unhandledRejection 进而触发 fatal() 把整个桥接拖死。必须用 .catch。
         s.flush(true).catch((e) => warn(`[${k}] 超时中断时 flush 失败: ${e.message}`));
-        s.sendQQ(`⚠️ 这轮任务已 ${mins} 分钟没有任何进展，我把它强制中断了。可以换个说法或拆小一点再试。`, { plain: true }).catch(() => {});
+        s.sendQQ(`⚠️ 这轮任务已 ${mins} 分钟没有任何进展，我把它强制中断了。可以换个说法或拆小一点再试。`, { plain: true }).catch((e) => warn(`发送提示失败: ${e.message}`));
         s.drainQueue();
       }
     }, Math.max(1000, Math.min(60000, TURN_TIMEOUT_MS / 2)));
@@ -3979,16 +4147,9 @@ function start() {
       for (const [k, s] of sessions) {
         if (s.closed) continue;
         if (DEBUG_ON) debug(`[${k}] tick busy=${s.busy} work=${s.workLabel || '-'} idle=${Math.round((now - (s.lastOutputAt || s.lastEventAt || now)) / 1000)}s sent=${s.silenceNotices || 0}`);
-        // busy = 正在跑一轮 prompt; workLabel = 正在跑一个耗时的非 prompt 操作
-        if (!s.busy && !s.workLabel) continue;
-        const idle = now - (s.lastOutputAt || s.lastEventAt || now);
-        if (idle < SILENCE_MS) continue;
-        const sent = s.silenceNotices || 0;
-        if (sent >= SILENCE_MAX) continue;
-        // 提醒间隔逐次拉长 (45s/90s/135s…), 否则长任务会被同一条消息刷屏
-        const need = SILENCE_MS * (sent + 1);
-        if (now - (s.lastSilenceNoticeAt || 0) < need) continue;
-        s.silenceNotices = sent + 1;
+        const idle = silenceDue(s, now, SILENCE_MS, SILENCE_MAX);
+        if (idle === null) continue;
+        s.silenceNotices = (s.silenceNotices || 0) + 1;
         s.lastSilenceNoticeAt = now;
         const secs = Math.round(idle / 1000);
         // 具体卡在哪一步(思考/哪个工具)只写日志, 不发 QQ
@@ -4012,7 +4173,7 @@ function start() {
   if (stateLoadError) {
     sendAlert(`⚠️ state.json 读取失败（${stateLoadError}）\n`
       + `已把坏文件留档到 ${stateBrokenPath || '(改名失败)'}。\n`
-      + '会话引用现在是空的 —— 现有会话文件不会立刻丢，但 /resume 列表会变空。').catch(() => {});
+      + '会话引用现在是空的 —— 现有会话文件不会立刻丢，但 /resume 列表会变空。').catch((e) => warn(`发送提示失败: ${e.message}`));
   }
 
   // 告诉 systemd 启动完成 (Type=notify)。放在最后: 此时 WS 与各定时器都已就位。

@@ -30,7 +30,7 @@ fs.writeFileSync(path.join(BASE, 'config.json'), JSON.stringify({
 
 const src = fs.readFileSync(path.join(__dirname, 'bridge.js'), 'utf8');
 fs.writeFileSync(path.join(BASE, 'bridge.js'), `${src}
-module.exports = { PiSession, sessions, alertTarget, cfg, onebot, fetchGroupContext, GROUP_CTX_CACHE, sweepStorage, STATE, dispatchCommand, HELP, requestRestart, maybeRestartNow, busySessionCount, setExitHook, restartState, mdToPlain, getSession, creatingSessions, markRestart, takeRestartMark, RESTART_MARK, normalizeTask, runShell, TASKS, mergeTaskFiles };
+module.exports = { PiSession, sessions, alertTarget, cfg, onebot, fetchGroupContext, GROUP_CTX_CACHE, sweepStorage, STATE, dispatchCommand, HELP, requestRestart, maybeRestartNow, busySessionCount, setExitHook, restartState, mdToPlain, getSession, creatingSessions, markRestart, takeRestartMark, RESTART_MARK, normalizeTask, runShell, TASKS, mergeTaskFiles, silenceDue, isPrivateHost, safeFetchUrl, toContainerPath };
 `);
 
 const results = [];
@@ -158,6 +158,45 @@ const ok = (name, pass, extra) => { results.push({ name, pass }); console.log(`$
     B.GROUP_CTX_CACHE.clear();
   }
 
+  // ---- SSRF 兜底: 内网地址必须被拒 (原来入站下载完全不校验目标)
+  {
+    const priv = ['127.0.0.1', '10.0.0.5', '192.168.1.1', '172.16.3.4', '169.254.169.254',
+      'localhost', 'foo.localhost', '::1', '0.0.0.0', '100.64.0.1'];
+    const pub = ['example.com', '8.8.8.8', '1.1.1.1', '223.5.5.5', '172.32.0.1', '192.169.0.1'];
+    const badPriv = priv.filter((h) => !B.isPrivateHost(h));
+    const badPub = pub.filter((h) => B.isPrivateHost(h));
+    ok('内网地址被拒', badPriv.length === 0, `漏了: ${badPriv.join(',')}`);
+    ok('公网地址放行', badPub.length === 0, `误拒: ${badPub.join(',')}`);
+    ok('非 http(s) 协议被拒', B.safeFetchUrl('file:///etc/passwd') === null);
+    ok('内网 URL 被拒', B.safeFetchUrl('http://127.0.0.1:3001/x') === null);
+    ok('公网 URL 放行', B.safeFetchUrl('https://example.com/a') !== null);
+  }
+
+  // ---- toContainerPath: 宿主 outbox 路径要映射成容器路径
+  {
+    const c = B.cfg.files.outboxDir;
+    const inside = B.toContainerPath(`${c}/sub/a.txt`);
+    ok('outbox 内路径被映射', inside === `${B.cfg.files.containerOutbox}/sub/a.txt`, inside);
+    ok('outbox 外路径原样返回', B.toContainerPath('/etc/passwd') === '/etc/passwd', B.toContainerPath('/etc/passwd'));
+  }
+
+  // ---- onStdout 跨 chunk 分帧: 一行 JSON 被切成两半也要能拼回来
+  {
+    const s = new B.PiSession('private_frame', { type: 'private', id: 'frame' });
+    s.stdoutBuf = Buffer.alloc(0);
+    const recs = [];
+    s.onRecord = (r) => recs.push(r);
+    const buf = Buffer.from(`${JSON.stringify({ type: 'message_update', foo: 'bar' })}\n`, 'utf8');
+    const cut = Math.floor(buf.length / 2);
+    s.onStdout(buf.subarray(0, cut));
+    ok('半个 chunk 不产生记录', recs.length === 0, `n=${recs.length}`);
+    s.onStdout(buf.subarray(cut));
+    ok('拼回完整行后产生记录', recs.length === 1 && recs[0].foo === 'bar', JSON.stringify(recs));
+    s.onStdout(Buffer.from(`${JSON.stringify({ type: 'x', n: 1 })}\r\n`, 'utf8'));
+    ok('CRLF 行尾被正确处理', recs.length === 2 && recs[1].n === 1, JSON.stringify(recs));
+    s.closed = true;
+  }
+
   // ---- 修复 6: WS 重连互斥
   {
     const ob = B.onebot;
@@ -172,15 +211,27 @@ const ok = (name, pass, extra) => { results.push({ name, pass }); console.log(`$
   {
     const s = new B.PiSession('private_9', { type: 'private', id: '9' });
     s.proc = { stdin: { writable: true, write: (d, cb) => { if (cb) cb(null); }, on: () => {} } };
-    // 模拟: pi 一直在发 thinking_delta, lastEventAt 被不断刷新, 但用户看不到任何东西
-    s.lastEventAt = Date.now();
-    s.lastOutputAt = Date.now() - 120000;   // 已经 2 分钟没给用户发过话
-    s.busy = true;
+    const now = Date.now();
     const SILENCE_MS = 45000;
-    const idleByEvent = Date.now() - s.lastEventAt;   // 旧算法: 很小, 不会提醒
-    const idleByOutput = Date.now() - s.lastOutputAt; // 新算法: 120s, 会提醒
-    ok('旧算法(按事件)会漏掉思考期的静默', idleByEvent < SILENCE_MS, `idleByEvent=${Math.round(idleByEvent / 1000)}s`);
-    ok('新算法(按输出)能认出静默', idleByOutput >= SILENCE_MS, `idleByOutput=${Math.round(idleByOutput / 1000)}s`);
+    // 直接调 bridge 的判定函数。原来这里是测试自己算 idleByEvent/idleByOutput
+    // 再做算术比较 —— 恒真, silenceDue 改坏了测试照样绿。
+    // 模拟: pi 一直在发 thinking_delta 刷新 lastEventAt, 但用户 2 分钟没看到东西
+    s.lastEventAt = now;
+    s.lastOutputAt = now - 120000;
+    s.busy = true;
+    ok('思考期静默会被判定要提醒', B.silenceDue(s, now, SILENCE_MS, 5) >= SILENCE_MS);
+    s.lastOutputAt = now - 1000;
+    ok('刚给用户发过话就不提醒', B.silenceDue(s, now, SILENCE_MS, 5) === null);
+    s.busy = false;
+    ok('不忙就不提醒', B.silenceDue(s, now, SILENCE_MS, 5) === null);
+    s.busy = true; s.lastOutputAt = now - 120000;
+    s.silenceNotices = 5;
+    ok('提醒次数用满后不再提醒', B.silenceDue(s, now, SILENCE_MS, 5) === null);
+    s.silenceNotices = 1; s.lastSilenceNoticeAt = now - 1000;
+    ok('提醒间隔没到不重复提醒', B.silenceDue(s, now, SILENCE_MS, 5) === null);
+    s.lastSilenceNoticeAt = now - 100000;
+    ok('间隔到了会再提醒一次', B.silenceDue(s, now, SILENCE_MS, 5) >= SILENCE_MS);
+    s.silenceNotices = 0; s.lastSilenceNoticeAt = 0;
 
     // sendQQ 应该刷新 lastOutputAt
     const before = s.lastOutputAt;
