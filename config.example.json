@@ -19,6 +19,9 @@
     "allowAllGroups": false,
     "requireAtInGroup": true
   },
+  "tasks": {
+    "allowExec": true
+  },
   "files": {
     "outboxDir": "",
     "containerOutbox": "/app/napcat/config/outbox",

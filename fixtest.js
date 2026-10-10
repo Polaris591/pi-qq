@@ -619,8 +619,9 @@ const ok = (name, pass, extra) => { results.push({ name, pass }); console.log(`$
     a.s.buf = '';
     a.s.onRecord({ type: 'agent_settled' });
     ok('已排上重试', a.s.retryPending === true && a.s.retryTimer !== null);
-    a.s.abortRequested = true;
-    clearTimeout(a.s.retryTimer); a.s.retryTimer = null; a.s.retryPending = false;
+    // 必须走真实的 /stop 分支。原来测试自己 clearTimeout 掉定时器再断言「不再重发」,
+    // 等于替被测代码把活干了: /stop 忘了清定时器也照样通过。
+    await B.dispatchCommand(a.s, '/stop', '', { isGroup: false, userId: '91', groupId: '', userName: '', key: 'private_91' });
     await new Promise((r) => setTimeout(r, 700));
     ok('/stop 后不再重发', a.prompts.filter((x) => x === '要停掉的').length === 1,
       JSON.stringify(a.prompts));

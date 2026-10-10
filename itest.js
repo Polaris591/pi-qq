@@ -269,9 +269,14 @@ function startBridge(cfg) {
   section('访问控制');
   napcat.sent.length = 0;
   // 白名单外的私聊: 应该被忽略
+  // 断言必须看「这一段新增的日志」, 不能扫全量: bridge 打印的是
+  // \`spawn: \${cfg.pi.bin}\`, itest 里 bin 是绝对路径, /spawn: pi/ 永远不匹配,
+  // 之前这条断言恒真, 等于访问控制根本没测。
+  const aclLogBefore = getLog().length;
   napcat.sayPrivate('你好', { userId: 999 });
   await sleep(1200);
-  ok('白名单外私聊被忽略', !/spawn: pi/.test(getLog()), '');
+  const aclAdded = getLog().slice(aclLogBefore);
+  ok('白名单外私聊被忽略', !aclAdded.includes('spawn:'), aclAdded.trim().slice(0, 200));
 
   // 群里没 @ 机器人: 应该被忽略
   const before = getLog().length;
@@ -437,7 +442,10 @@ function startBridge(cfg) {
   const tl = getLog();
   // once 任务时间已过 => recalcTasks 会直接把它停用 (nextRun=0), 不一定走"跳过"分支
   ok('过期任务未执行', !/执行定时任务: itest-once/.test(tl), '');
-  ok('过期任务被停用或跳过', /跳过过期任务/.test(tl) || /新增定时任务: itest-once/.test(tl), '');
+  // 原来还有一条 \`跳过过期任务 || 新增定时任务: itest-once\` 的断言, 后半只要
+  // 任务文件被读进来就成立, 与「有没有跳过过期任务」无关, 等于恒真, 已删除。
+  // once 过期走的是「直接停用」分支 (nextRun=0, enabled=false), 那条路径不打日志,
+  // 从子进程外部观测不到, 所以这里只保留「未执行」这一条有判别力的断言。
 
   // ============================================================ 10. 稳定性
   section('稳定性');

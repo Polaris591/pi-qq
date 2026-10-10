@@ -313,7 +313,8 @@ B.cfg.persona.groupBoundary = '';
 ok('边界置空时不注入', B.personaPrompt({ type: 'group', id: G }) === '');
 B.cfg.persona.text = savedPersona.text;
 B.cfg.persona.groupBoundary = savedPersona.groupBoundary;
-ok('性格文案来自配置', typeof B.cfg.persona.text === 'string');
+// 这里原来有一条 \`typeof cfg.persona.text === 'string'\` 的断言 —— 配置里本来就是
+// 字符串, 恒真, 已删除。配置文案真的进了 prompt 由上面的「私聊注入性格」覆盖。
 
 // ---- 环境说明 (必须由桥接注入: CLI 的 --append-system-prompt 会取代 APPEND_SYSTEM.md)
 const ep = B.envPrompt();
@@ -634,8 +635,8 @@ ok('多个引用只取第一个', pm5.replyId === '1');
   await new Promise((r) => setTimeout(r, 50));
   ok('心跳恢复 -> 清除掉线标记', B.qqDown === false);
   ok('恢复时发出 QQ 通知', sent.some((x) => x.action === 'send_private_msg' && String(x.params.message).includes('QQ 已恢复')), '');
-  // 心跳超时检测逻辑: 直接断言阈值读取
-  ok('heartbeatTimeoutMs 可配置', B.cfg.behavior.heartbeatTimeoutMs === 90000);
+  // 这里原来断言 heartbeatTimeoutMs === 90000, 而上面刚把它赋成 90000, 是回读
+  // 自己的写入 (恒真), 已删除。真正的看门狗定时器在 start() 里启动, 单测不启它。
   // 重复掉线不重复告警
   sent.length = 0;
   B.onebot.onRecord({ post_type: 'meta_event', meta_event_type: 'heartbeat', status: { online: false, good: false } });

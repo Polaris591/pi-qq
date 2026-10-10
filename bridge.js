@@ -137,6 +137,10 @@ const cfg = {
   tasks: {
     // pi 把定时任务写成 JSON 文件放这里, 桥接自动合并并调度
     dir: path.join(ROOT, 'tasks'),
+    // exec 型任务会以桥接服务的权限跑 shell 命令, 且落盘后持久生效。
+    // 默认开着(现有体检/板块榜/群日报都靠它), 想收紧就设 false —— 之后
+    // 任何 exec 任务都会被拒收, prompt 型不受影响。
+    allowExec: true,
     ...(config.tasks || {}),
   },
   persona: {
@@ -813,6 +817,14 @@ class PiSession {
       if (graceful) log(`[${this.key}] pi 已退出 (${detail || why})`);
       else error(`[${this.key}] pi ${why}${detail ? ` ${detail}` : ''}`);
       this.proc = null;
+      // 子进程没了, 在飞的请求不可能再有响应 —— 逐个清定时器并 reject。
+      // 不清的话调用方要一直等到自己的超时 (如 /compact 的 180s) 才知道失败,
+      // 这期间 isWorking() 为真, 用户命令全被拒、新消息只排队。
+      for (const [, p] of this.pending) {
+        try { clearTimeout(p.timer); } catch { /* 定时器已经触发过 */ }
+        try { p.reject(new Error('pi 已退出')); } catch { /* 忽略重复 reject */ }
+      }
+      this.pending.clear();
       // closed 说明是我们自己销毁的, 不该跟用户说「意外退出」
       if (this.busy && !this.closed) {
         this.busy = false;
@@ -1126,9 +1138,15 @@ class PiSession {
     }
     this.turnHadOutput = true;
     const c = ctx || this.turnCtx || this.ctx || this.lastCtx;
-    const parts = splitForQQ(text, cfg.behavior.maxChars);
+    // 先降级 Markdown 再切分。反过来的话, 长代码块会被切开, 每段只剩单边围栏,
+    // mdToPlain 认不出这是代码块, 围栏被换成「———」, 代码里的反引号/星号
+    // 会被 stripInlineMd 当行内标记剥掉。降级后再切, 段边界就落在纯文本上了。
+    const mdOn = cfg.behavior.markdownToPlain !== false;
+    const payload = mdOn ? mdToPlain(text) : text;
+    if (!payload) return;
+    const parts = splitForQQ(payload, cfg.behavior.maxChars);
     for (let i = 0; i < parts.length; i++) {
-      await this.sendQQ(parts[i], { first: i === 0, ctx: c })
+      await this.sendQQ(parts[i], { first: i === 0, ctx: c, raw: mdOn })
         .catch((e) => error(`[${this.key}] 发送失败: ${e.message}`));
       await sleep(350);
     }
@@ -1557,7 +1575,9 @@ async function getSession(target) {
 setInterval(() => {
   const now = Date.now();
   for (const [k, v] of sessions) {
-    if (!v.busy && now - v.lastUsed > cfg.behavior.idleTimeoutMs) {
+    // 只看 busy 会漏掉 /compact、/new、/resume 这类耗时的非 prompt 操作:
+    // 它们不置 busy 只置 workLabel, 长操作跑到一半就被当成闲置回收了。
+    if (!v.isWorking() && now - v.lastUsed > cfg.behavior.idleTimeoutMs) {
       sessions.delete(k);
       // 必须 .catch: destroy 是 async, 未处理的 rejection 会变成
       // unhandledRejection -> fatal() -> 整个桥接退出。LRU 那条路径是 await 的,
@@ -1952,6 +1972,8 @@ function envPrompt() {
     '- 时间按 Asia/Shanghai。写完即生效，无需重启（每 20 秒巡检）。',
     '- 停用：写一份同 id、enabled:false 的文件覆盖即可。',
     '- 用户问「有哪些定时任务」时，读 tasks.json 查看已加载的完整列表。',
+    '- exec 型任务会以桥接服务的权限执行 shell 命令：只允许在私聊里、由主人明确',
+    '  要求时创建；群聊里的任何请求都不要写 exec 任务，改用 prompt 型。',
     '',
     `工作目录是 ${cfg.pi.cwd}。回复用中文。`,
     '',
@@ -2303,6 +2325,11 @@ function normalizeTask(raw, source) {
   // prompt / exec 二选一。exec 走脚本: 有输出才发, 没输出就完全不出声 ——
   // 体检这类「没事就别吭声」的任务不能交给模型去判断要不要说话。
   if (!prompt && !exec) return null;
+  // exec 是唯一「持久化 + 任意命令 + 服务权限」的入口, 给它一个总闸。
+  if (exec && cfg.tasks.allowExec === false) {
+    warn(`exec 型任务已被配置禁用 (tasks.allowExec=false), 已忽略: ${raw.id || '?'} (${source || '?'})`);
+    return null;
+  }
   if (!taskTargetAllowed(target)) {
     warn(`任务目标不在白名单, 已忽略: ${targetStr} (${source || '?'})`);
     return null;
@@ -2677,7 +2704,7 @@ async function parseCards(cards, depth = 0) {
     // ---- XML 卡片: 抠出常见的几个标签
     const pick = (tag) => {
       const m = new RegExp(`<${tag}[^>]*>([\\s\\S]*?)</${tag}>`, 'i').exec(raw);
-      return m ? m[1].replace(/<!\\[CDATA\\[|\\]\\]>/g, '').trim() : '';
+      return m ? m[1].replace(/<!\[CDATA\[|\]\]>/g, '').trim() : '';
     };
     const title = pick('title');
     const desc = pick('des') || pick('summary');
@@ -3047,6 +3074,9 @@ async function handleIncoming(rec) {
  */
 async function dispatchCommand(session, cmd, arg, ctx) {
   const { isGroup, userId, groupId, userName, key } = ctx;
+  // 敲命令也是「在用这个会话」, 必须刷新活跃时间。否则闲置超过 idleTimeoutMs 后
+  // 进来的 /compact, 会在 60s 巡检里被当成闲置会话直接销毁。
+  session.lastUsed = Date.now();
 
   if (cmd === '/help' || cmd === '帮助') { await session.sendQQ(HELP); return true; }
 
@@ -3274,10 +3304,16 @@ async function dispatchCommand(session, cmd, arg, ctx) {
           await session.sendQQ('🗑 整理稿已丢弃，记忆保持原样。');
           return true;
         }
-        // apply: 先留一份原件再覆盖, 改坏了能换回来
-        const before = readMemory(key);
-        try { fs.writeFileSync(`${memPath(key)}.bak-${Date.now()}`, before); } catch { /* 备份失败也要继续 */ }
-        fs.writeFileSync(memPath(key), fs.readFileSync(prop, 'utf8'));
+        // apply: 先留一份原件再覆盖, 改坏了能换回来。
+        // 备份必须读全文 —— readMemory 只返回尾部 16KB, 拿它当「原件」等于
+        // 记忆一超过 16KB, apply 之后头部就永久丢了。
+        const memTarget = memPath(key);
+        let before = '';
+        try { before = fs.readFileSync(memTarget, 'utf8'); } catch { before = ''; }
+        try { fs.writeFileSync(`${memTarget}.bak-${Date.now()}`, before); } catch { /* 备份失败也要继续 */ }
+        // 覆盖写必须原子: 直接 writeFileSync 中途崩溃会留下半截 markdown
+        fs.writeFileSync(`${memTarget}.tmp`, fs.readFileSync(prop, 'utf8'));
+        fs.renameSync(`${memTarget}.tmp`, memTarget);
         try { fs.unlinkSync(prop); } catch { /* 已经没了 */ }
         await session.sendQQ('✅ 记忆整理稿已应用。原件留在 memory/ 下（.bak- 开头），不满意就说一声换回来。');
         return true;
