@@ -1192,11 +1192,15 @@ class PiSession {
     if (!payload) return;
     this.turnHadOutput = true;
     const parts = splitForQQ(payload, cfg.behavior.maxChars);
-    for (let i = 0; i < parts.length; i++) {
-      await this.sendQQ(parts[i], { first: i === 0, ctx: c, raw: mdOn })
-        .catch((e) => error(`[${this.key}] 发送失败: ${e.message}`));
-      await sleep(350);
-    }
+    const run = async () => {
+      for (let i = 0; i < parts.length; i++) {
+        await this.sendQQ(parts[i], { first: i === 0, ctx: c, raw: mdOn })
+          .catch((e) => error(`[${this.key}] 发送失败: ${e.message}`));
+        if (i + 1 < parts.length) await sleep(350);
+      }
+    };
+    this.flushChain = (this.flushChain || Promise.resolve()).then(run, run);
+    return this.flushChain;
   }
 
   /**
@@ -2802,7 +2806,7 @@ async function fetchGroupContext(groupId, selfId, triggerId) {
  *
  * 都拿不到就返回空串, 由调用方退回占位符。
  */
-async function parseCards(cards, depth = 0) {
+async function parseCards(cards, depth = 0, seen = new Set()) {
   if (!Array.isArray(cards) || !cards.length || depth > 2) return '';
   const out = [];
 
@@ -2820,7 +2824,7 @@ async function parseCards(cards, depth = 0) {
       const summary = j?.meta?.detail?.summary || j?.desc || '聊天记录';
       const source = j?.meta?.detail?.source || '';
       let inner = '';
-      if (resid) inner = await fetchForwardContent(String(resid), depth);
+      if (resid) inner = await fetchForwardContent(String(resid), depth, seen);
       out.push([
         '【合并转发】' + (source ? `（${source}）` : ''),
         summary ? `摘要: ${summary}` : '',
@@ -2865,29 +2869,32 @@ async function parseCards(cards, depth = 0) {
 
 /** 取合并转发里的消息, 拼成可读文本 */
 // 合并转发可以互相嵌套, 每层 30 条 × 3 张卡递归下去, 理论扇出上万次 API 调用
-// (每次 10s 超时)。用「同 resid 只展开一次 + 时间窗内总量封顶」把扇出压住。
-const FORWARD_SEEN = new Map();   // resid -> at
+// (每次 10s 超时)。用「单次解析树内 seen 防环 + 全局时间窗内总量封顶」把扇出压住,
+// 同时不影响用户在 5 分钟内二次引用/追问同一条合并转发。
+const FORWARD_CALLS = [];   // timestamps of recent get_forward_msg calls
 const FORWARD_WINDOW_MS = 5 * 60 * 1000;
 const FORWARD_MAX_PER_WINDOW = 40;
-function forwardBudgetOk(key) {
+function forwardBudgetOk(key, seen) {
+  if (seen && seen.has(key)) return false;
   const now = Date.now();
-  for (const [k, t] of FORWARD_SEEN) if (now - t > FORWARD_WINDOW_MS) FORWARD_SEEN.delete(k);
-  if (FORWARD_SEEN.has(key)) return false;
-  if (FORWARD_SEEN.size >= FORWARD_MAX_PER_WINDOW) return false;
-  FORWARD_SEEN.set(key, now);
+  while (FORWARD_CALLS.length && now - FORWARD_CALLS[0] > FORWARD_WINDOW_MS) FORWARD_CALLS.shift();
+  if (FORWARD_CALLS.length >= FORWARD_MAX_PER_WINDOW) return false;
+  if (seen) seen.add(key);
+  FORWARD_CALLS.push(now);
   return true;
 }
 
-async function fetchForwardContent(resid, depth = 0) {
+async function fetchForwardContent(resid, depth = 0, seen = new Set()) {
   if (!resid || depth > 2) return '';
-  // 命中预算/重复时给占位文字而不是空串 —— 空串会让这段转发内容静默消失
-  if (!forwardBudgetOk(String(resid))) return '[转发内容过多或重复，已省略]';
+  // 命中预算/同树递归重复时给占位文字而不是空串 —— 空串会让这段转发内容静默消失
+  if (!forwardBudgetOk(String(resid), seen)) return '[转发内容过多或重复，已省略]';
   let msgs = [];
   try {
     const r = await onebot.action('get_forward_msg', { id: String(resid) }, 10000);
     msgs = (r && r.data && (r.data.messages || r.data)) || [];
   } catch (e) {
     warn(`取合并转发失败: ${e.message}`);
+    seen.delete(String(resid));
     return '';
   }
   if (!Array.isArray(msgs) || !msgs.length) return '';
@@ -2903,7 +2910,7 @@ async function fetchForwardContent(resid, depth = 0) {
         .filter(Boolean).join(' ');
       // 嵌套转发: 递归解析 (有深度限制)
       if (p.cards && p.cards.length) {
-        const inner = await parseCards(p.cards, depth + 1);
+        const inner = await parseCards(p.cards, depth + 1, seen);
         if (inner) body = [body, inner].filter(Boolean).join(' ');
       }
     } catch { body = String(m.raw_message || ''); }
@@ -3115,7 +3122,7 @@ async function handleIncoming(rec) {
   let text = parsed.text;
 
   if (isGroup && cfg.access.requireAtInGroup) {
-    const atMe = parsed.mentions.includes(selfId) || parsed.mentions.includes('all');
+    const atMe = parsed.mentions.includes(selfId);
     if (!atMe) return;
     text = text.replace(new RegExp(`@${selfId}\\s*`, 'g'), '').trim();
   }
