@@ -333,8 +333,11 @@ function readSessionSummary(file) {
       : `${Math.max(1, Math.round(st.size / 1024))}KB`;
     const fd = fs.openSync(file, 'r');
     const buf = Buffer.alloc(Math.min(65536, st.size));
-    fs.readSync(fd, buf, 0, buf.length, 0);
-    fs.closeSync(fd);
+    try {
+      fs.readSync(fd, buf, 0, buf.length, 0);
+    } finally {
+      try { fs.closeSync(fd); } catch {}
+    }
     for (const line of buf.toString('utf8').split('\n')) {
       if (!line.trim()) continue;
       let rec;
@@ -430,7 +433,7 @@ function parseMessage(raw, segs) {
     let m;
     while ((m = re.exec(raw))) {
       if (m.index > last) text += raw.slice(last, m.index);
-      const params = {};
+      const params = Object.create(null);
       for (const kv of (m[2] || '').replace(/^,/, '').split(',')) {
         if (!kv) continue;
         const i = kv.indexOf('=');
@@ -2476,8 +2479,8 @@ function mergeTaskFiles() {
         if (TASKS[idx].source && TASKS[idx].source !== f) {
           warnTaskFileOnce(`taskdup:${t.id}:${f}`, `任务 id 冲突: ${t.id} 同时出现在 ${TASKS[idx].source} 和 ${f}, 后者覆盖前者`);
         }
-        // 保留运行记录, 其余字段以文件为准
-        const keep = { lastRun: TASKS[idx].lastRun, nextRun: TASKS[idx].nextRun, createdAt: TASKS[idx].createdAt };
+        // 保留上次运行与创建时间, nextRun 置 0 以便按新配置重算
+        const keep = { lastRun: TASKS[idx].lastRun, nextRun: 0, createdAt: TASKS[idx].createdAt };
         TASKS[idx] = { ...t, ...keep };
       } else {
         TASKS.push(t);
@@ -2493,13 +2496,14 @@ function mergeTaskFiles() {
     }
     try { fs.unlinkSync(full); } catch { /* 删除失败则下轮重复合并, 幂等 */ }
   }
-  if (changed) { recalcTasks(); saveTasks(); }
+  if (changed) { recalcTasks(true); saveTasks(); }
   return changed;
 }
 
-function recalcTasks() {
+function recalcTasks(onlyMissing = false) {
   for (const t of TASKS) {
     if (!t.enabled) { t.nextRun = 0; continue; }
+    if (onlyMissing && t.nextRun > 0) continue;
     const n = nextRunAt(t);
     if (n == null) {
       // once 任务的时间已过 => 自动停用
@@ -3120,6 +3124,9 @@ async function handleIncoming(rec) {
 
   const parsed = parseMessage(rec.raw_message, rec.message);
   let text = parsed.text;
+
+  // 群里有新消息到达时使该群的上下文缓存失效, 保证紧接着 @ 机器人时能看到刚发的这句
+  if (isGroup) GROUP_CTX_CACHE.delete(String(groupId));
 
   if (isGroup && cfg.access.requireAtInGroup) {
     const atMe = parsed.mentions.includes(selfId);
