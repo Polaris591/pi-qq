@@ -420,12 +420,14 @@ function startBridge(cfg) {
 
   // ============================================================ 8. Markdown 降级
   section('Markdown 降级');
+  fs.mkdirSync(path.join(WORK, 'memory'), { recursive: true });
+  fs.writeFileSync(path.join(WORK, 'memory', 'private_20001.md'), '## 标题测试\n- **加粗内容**\n');
   napcat.sent.length = 0;
   napcat.sayPrivate('/memory');
   await sleep(1200);
   const mdTexts = napcat.texts({ action: 'send_private_msg' });
-  ok('输出不含 ##', !mdTexts.some((t) => /(^|\n)#{1,6}\s/.test(t)));
-  ok('输出不含 **', !mdTexts.some((t) => t.includes('**')));
+  ok('输出不含 ##', mdTexts.length > 0 && !mdTexts.some((t) => /(^|\n)#{1,6}\s/.test(t)));
+  ok('输出不含 **', mdTexts.length > 0 && !mdTexts.some((t) => t.includes('**')));
 
   // ============================================================ 9. 定时任务
   section('定时任务');

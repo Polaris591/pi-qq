@@ -5,10 +5,14 @@ tasks.json
 sessions/
 memory/
 inbox/
+outbox
 outbox/
+*.log
+
+# 快照/备份
 *.bak
 *.bak-*
-*.log
+backups/
 
 # 依赖
 node_modules/
@@ -18,3 +22,17 @@ node_modules/
 .idea/
 .DS_Store
 *.swp
+
+# 会话快照含真实聊天内容, 不入库
+sessions.bak/
+.cf-guard.state
+.restart-request
+
+# 板块榜的行情缓存: 每天重拉, 没必要进仓库
+workspace/tools/data/kline/
+workspace/tools/data/_*.json
+__pycache__/
+*.pyc
+
+# 本机密钥与凭据
+secrets/

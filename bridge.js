@@ -944,8 +944,13 @@ class PiSession {
           this.rejectRequeues = tries + 1;
           this.queue.unshift(this.lastPrompt);
           log(`[${this.key}] prompt 被拒(压缩中), 已重新排队 (第 ${this.rejectRequeues} 次)`);
-          const t = setTimeout(() => { if (!this.closed) this.drainQueue(); }, 2000);
-          if (t.unref) t.unref();
+          if (this.requeueTimer) clearTimeout(this.requeueTimer);
+          this.requeueTimer = setTimeout(() => {
+            this.requeueTimer = null;
+            if (!this.closed) this.drainQueue();
+          }, 2000);
+          if (this.requeueTimer.unref) this.requeueTimer.unref();
+          return;
         } else {
           this.rejectRequeues = 0;
           this.sendQQ(`❌ 这条消息没能跑起来：${msg}`, { plain: true }).catch((e) => warn(`发送提示失败: ${e.message}`));
@@ -1082,7 +1087,7 @@ class PiSession {
         this.lastSilenceNoticeAt = 0;
         this.busy = false;
         if (DEBUG_ON) debug(`[${this.key}] busy=false (agent_settled)`);
-        if (this.pendingErrorNotice && !this.turnHadOutput && !this.abortRequested) {
+        if (this.pendingErrorNotice && this.lastStopReason === 'error' && !this.abortRequested) {
           const notice = this.pendingErrorNotice;
           this.pendingErrorNotice = null;
           this.emptyRetries = 0;
@@ -1106,8 +1111,14 @@ class PiSession {
             this.retryTimer = setTimeout(() => {
               this.retryTimer = null;
               this.retryPending = false;
-              // 这 500ms 里用户可能按了 /stop: 那就别再把他刚叫停的消息发一遍
-              if (this.closed || this.abortRequested) return;
+              if (this.closed) return;
+              // 这 500ms 里用户可能按了 /stop: 那就别再把他刚叫停的消息发一遍, 但要继续排队列
+              if (this.abortRequested) {
+                this.abortRequested = false;
+                this.drainQueue();
+                maybeRestartNow();
+                return;
+              }
               this.prompt(lp.text, lp.images, lp.ctx);
             }, 500);
           } else {
@@ -1130,9 +1141,10 @@ class PiSession {
         this.warnBigSessionOnce();
         // 重试已排上时先别 drain: 否则队列里的消息会抢在重试前面跑,
         // 既打乱顺序又会覆盖 lastPrompt。等重试这一轮结束自然会 drain。
-        if (!this.retryPending) this.drainQueue();
-        // 排上过重启请求的话, 这一轮结束、队列也 drain 完了才是重启的时机
-        maybeRestartNow();
+        if (!this.retryPending) {
+          this.drainQueue();
+          maybeRestartNow();
+        }
         break;
       }
       default:
@@ -1171,7 +1183,6 @@ class PiSession {
       if (hold) { text = safe; this.buf = hold; }
       if (!text) { this.armFlushTimer(); return; }
     }
-    this.turnHadOutput = true;
     const c = ctx || this.turnCtx || this.ctx || this.lastCtx;
     // 先降级 Markdown 再切分。反过来的话, 长代码块会被切开, 每段只剩单边围栏,
     // mdToPlain 认不出这是代码块, 围栏被换成「———」, 代码里的反引号/星号
@@ -1179,6 +1190,7 @@ class PiSession {
     const mdOn = cfg.behavior.markdownToPlain !== false;
     const payload = mdOn ? mdToPlain(text) : text;
     if (!payload) return;
+    this.turnHadOutput = true;
     const parts = splitForQQ(payload, cfg.behavior.maxChars);
     for (let i = 0; i < parts.length; i++) {
       await this.sendQQ(parts[i], { first: i === 0, ctx: c, raw: mdOn })
@@ -1269,7 +1281,7 @@ class PiSession {
    * 只看 busy 会让 /compact 期间敲进来的命令和压缩流程打架。
    */
   isWorking() {
-    return this.busy || !!this.workLabel;
+    return this.busy || !!this.workLabel || !!this.retryPending;
   }
 
   send(cmd) {
@@ -1307,7 +1319,7 @@ class PiSession {
     }
     // 进程正在退避重启中: 消息进队列等它回来, 而不是在这里重建进程
     const waitingRespawn = !this.proc && !this.closed && !!this.respawnTimer;
-    if (this.busy || this.workLabel || waitingRespawn) {
+    if (this.busy || this.workLabel || this.retryPending || waitingRespawn) {
       // 群里多人同时问时, 排队的人应该知道自己排到了哪 —— 否则只会觉得"没反应"。
       // 同一个人只提示一次(10 秒内不重复), 避免连发几条时刷屏。
       const now = Date.now();
@@ -1493,6 +1505,7 @@ class PiSession {
     if (this.flushTimer) { clearTimeout(this.flushTimer); this.flushTimer = null; }
     // 退避重启可能已经排上了, 必须取消, 否则会话销毁后进程又自己回来了
     if (this.respawnTimer) { clearTimeout(this.respawnTimer); this.respawnTimer = null; }
+    if (this.requeueTimer) { clearTimeout(this.requeueTimer); this.requeueTimer = null; }
     if (this.retryTimer) { clearTimeout(this.retryTimer); this.retryTimer = null; this.retryPending = false; }
     // 排队中的消息一旦丢弃就永远没了, 必须告诉用户, 否则他以为排上了其实石沉大海。
     // 触发场景: 闲置 30 分钟回收 / LRU 淘汰 / /reset / 关闭服务。
@@ -2591,40 +2604,43 @@ async function runTask(t) {
   }
 
   // 等任务跑完再销毁, 避免长期占用进程; 两个定时器互相清理, 保证只销毁一次
-  let finished = false;
-  const finish = async (why, errNote) => {
-    if (finished) return;
-    finished = true;
-    clearInterval(iv);
-    clearTimeout(deadline);
-    taskSessions.delete(ps);
-    await ps.destroy(why);
-    if (errNote) notifyTarget(target, errNote).catch((e) => warn(`发送提示失败: ${e.message}`));
-  };
+  return new Promise((resolveDone) => {
+    let finished = false;
+    const finish = async (why, errNote) => {
+      if (finished) return;
+      finished = true;
+      clearInterval(iv);
+      clearTimeout(deadline);
+      taskSessions.delete(ps);
+      await ps.destroy(why);
+      if (errNote) notifyTarget(target, errNote).catch((e) => warn(`发送提示失败: ${e.message}`));
+      resolveDone();
+    };
 
-  // 只看 busy 会把「刚握完手就崩掉」误判成完成: 消息还在 queue 里、busy 为假,
-  // 3 秒后就按「任务完成」销毁会话, 用户那边什么提示都没有。
-  const iv = setInterval(() => {
-    // 任务会话的 pi 一旦退出, 本轮 prompt 就丢了(respawn 不会重放已派发的消息),
-    // 必须报中断, 否则要等到 30 分钟 deadline 才说话。prompt 是直接派发的,
-    // 消息不进 queue, 所以不能靠 queue.length 判断(那样这个分支永远不成立)。
-    if (!ps.closed && ps.proc === null) {
-      finish('task crashed', `❌ 定时任务「${label}」执行中断（pi 进程退出）`);
-      return;
-    }
-    if (!ps.busy && !ps.isWorking() && !ps.queue.length) finish('task done');
-  }, 3000);
-  iv.unref();
-  const deadline = setTimeout(() => finish('task timeout',
-    `⏰ 定时任务「${label}」超时了（超过 30 分钟），已中止。可以把它拆小一点。`), 30 * 60 * 1000);
-  deadline.unref();
+    // 只看 busy 会把「刚握完手就崩掉」误判成完成: 消息还在 queue 里、busy 为假,
+    // 3 秒后就按「任务完成」销毁会话, 用户那边什么提示都没有。
+    const iv = setInterval(() => {
+      // 任务会话的 pi 一旦退出, 本轮 prompt 就丢了(respawn 不会重放已派发的消息),
+      // 必须报中断, 否则要等到 30 分钟 deadline 才说话。prompt 是直接派发的,
+      // 消息不进 queue, 所以不能靠 queue.length 判断(那样这个分支永远不成立)。
+      if (!ps.closed && ps.proc === null) {
+        finish('task crashed', `❌ 定时任务「${label}」执行中断（pi 进程退出）`);
+        return;
+      }
+      if (!ps.busy && !ps.isWorking() && !ps.queue.length) finish('task done');
+    }, 3000);
+    iv.unref();
+    const deadline = setTimeout(() => finish('task timeout',
+      `⏰ 定时任务「${label}」超时了（超过 30 分钟），已中止。可以把它拆小一点。`), 30 * 60 * 1000);
+    deadline.unref();
 
-  // 失败要主动告知: 任务在后台跑, 用户看不到日志, 不通知就等于悄悄不工作了
-  ps.onTaskError = (reason) => {
-    const tail = ps.stderrTail.join('').trim().split('\n').slice(-3).join('\n');
-    const body = tail ? `\n${mdToPlain(tail)}` : '';
-    finish('task error', `❌ 定时任务「${label}」执行失败（${reason}）${body}`);
-  };
+    // 失败要主动告知: 任务在后台跑, 用户看不到日志, 不通知就等于悄悄不工作了
+    ps.onTaskError = (reason) => {
+      const tail = ps.stderrTail.join('').trim().split('\n').slice(-3).join('\n');
+      const body = tail ? `\n${mdToPlain(tail)}` : '';
+      finish('task error', `❌ 定时任务「${label}」执行失败（${reason}）${body}`);
+    };
+  });
 }
 
 async function tickTasks() {
@@ -3103,7 +3119,7 @@ async function handleIncoming(rec) {
     if (!atMe) return;
     text = text.replace(new RegExp(`@${selfId}\\s*`, 'g'), '').trim();
   }
-  if (!text && !parsed.images.length && !parsed.files.length) return;
+  if (!text && !parsed.images.length && !parsed.files.length && !(parsed.cards && parsed.cards.length)) return;
 
   const target = isGroup ? { type: 'group', id: groupId } : { type: 'private', id: userId };
   const key = sessionKey(target);
@@ -3118,9 +3134,9 @@ async function handleIncoming(rec) {
   // getSession 只返回未销毁的实例, 所以再取一次就能拿到干净的那个。
   const live = session.closed ? await getSession(target) : session;
   // 群聊回复上下文: 引用触发消息并 @ 发送者。
-  // 同一会话连续来消息时这里会被覆盖, 所以本轮回复用独立的 turnCtx 快照。
+  // 若当前会话正忙, 不提前覆盖 live.ctx, 防止群友插话或敲 /status 把正在跑的那一轮引用目标串掉
   const ctx = { replyTo: rec.message_id, atUser: isGroup ? userId : null, userId, userName };
-  live.ctx = ctx;
+  if (!live.isWorking()) live.ctx = ctx;
   live.lastCtx = ctx;
 
   // 给触发消息贴表情 (仅群聊, 失败不影响主流程)
@@ -3893,7 +3909,7 @@ async function sweepOutbox() {
           const s = sessions.get(sessionKey(target));
           const msg = `❌ 文件 ${path.basename(it.full)} 发送失败: ${e.message}`;
           if (s) s.sendQQ(msg, { plain: true }).catch((e) => warn(`发送提示失败: ${e.message}`));
-          else onebot.action('send_private_msg', { user_id: Number(target.id), message: msg }).catch((e) => warn(`发送提示失败: ${e.message}`));
+          else notifyTarget(target, msg).catch((e) => warn(`发送提示失败: ${e.message}`));
         }
       }
     }
@@ -3928,7 +3944,7 @@ async function sweepStorage() {
   let removed = 0;
   let freed = 0;
 
-  // 1) 会话文件
+  // 1) 会话文件 (若 state.json 刚加载失败处于空状态, 跳过清理会话文件以防误删)
   const referenced = new Set();
   for (const k of Object.keys(STATE)) {
     const s = STATE[k];
@@ -3936,17 +3952,25 @@ async function sweepStorage() {
     if (s.sessionFile) referenced.add(path.basename(String(s.sessionFile)));
     for (const f of (Array.isArray(s.history) ? s.history : [])) referenced.add(path.basename(String(f)));
   }
-  try {
-    for (const f of fs.readdirSync(cfg.pi.sessionDir)) {
-      if (!f.endsWith('.jsonl')) continue;
-      if (referenced.has(f)) continue;
-      const full = path.join(cfg.pi.sessionDir, f);
-      let st;
-      try { st = fs.statSync(full); } catch { continue; }
-      if (now - st.mtimeMs < keepDays * dayMs) continue;
-      try { fs.unlinkSync(full); removed++; freed += st.size; } catch { /* 删不掉下轮再说 */ }
-    }
-  } catch { /* 目录不存在 */ }
+  for (const [, s] of sessions) {
+    if (s && s.sessionFile) referenced.add(path.basename(String(s.sessionFile)));
+  }
+  for (const s of taskSessions) {
+    if (s && s.sessionFile) referenced.add(path.basename(String(s.sessionFile)));
+  }
+  if (!stateLoadError) {
+    try {
+      for (const f of fs.readdirSync(cfg.pi.sessionDir)) {
+        if (!f.endsWith('.jsonl')) continue;
+        if (referenced.has(f)) continue;
+        const full = path.join(cfg.pi.sessionDir, f);
+        let st;
+        try { st = fs.statSync(full); } catch { continue; }
+        if (now - st.mtimeMs < keepDays * dayMs) continue;
+        try { fs.unlinkSync(full); removed++; freed += st.size; } catch { /* 删不掉下轮再说 */ }
+      }
+    } catch { /* 目录不存在 */ }
+  }
 
   // 2) inbox 缓存
   try {
@@ -4146,7 +4170,7 @@ function start() {
   const SELF_HEAL_MS = Math.max(30000, Number(cfg.behavior.selfHealMs) || 120000);
   selfHealTimer = setInterval(() => {
     const st = onebot.ws && onebot.ws.readyState;
-    const alive = st === WebSocket.OPEN || st === WebSocket.CONNECTING;
+    const alive = st === WebSocket.OPEN;
     const idle = Date.now() - lastSeenAt;
     if (!alive && idle > SELF_HEAL_MS * 2) {
       fatal('self-heal', new Error(`WS 已断开且 ${Math.round(idle / 1000)}s 无上报, 触发重启`));

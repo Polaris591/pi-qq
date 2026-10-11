@@ -489,6 +489,30 @@ const ok = (name, pass, extra) => { results.push({ name, pass }); console.log(`$
     await new Promise((r) => setTimeout(r, 40));
     ok('任务会话的 error 交给 onTaskError', s.taskErrCalled === true && sent.length === 0,
       `called=${s.taskErrCalled} sent=${sent.length}`);
+
+    // 普通会话: 中间重试 agent_end(error) 后被 agent_end(stop) 恢复 => 不发报错
+    s.onTaskError = null;
+    sent.length = 0;
+    s.onRecord({ type: 'agent_end', messages: [{ stopReason: 'error', errorMessage: 'terminated' }] });
+    s.buf = '重试成功后的完整回答内容。'.repeat(4);
+    s.onRecord({ type: 'agent_end', messages: [{ stopReason: 'stop' }] });
+    s.onRecord({ type: 'agent_settled' });
+    await new Promise((r) => setTimeout(r, 40));
+    ok('中间重试 error 后恢复不发报错', !sent.some((x) => x.includes('模型调用失败')) && sent.some((x) => x.includes('重试成功')),
+      JSON.stringify(sent));
+
+    // 普通会话: 即使先输出了半句话, 最终以 error 结束也必须在 agent_settled 发唯一一条报错
+    sent.length = 0;
+    s.buf = '先说半句话正在查日志。'.repeat(4);
+    s.onRecord({ type: 'agent_end', messages: [{ stopReason: 'error', errorMessage: 'Request timed out.' }] });
+    s.onRecord({ type: 'agent_end', messages: [{ stopReason: 'error', errorMessage: 'Request timed out.' }] });
+    s.onRecord({ type: 'agent_settled' });
+    await new Promise((r) => setTimeout(r, 40));
+    const errMsgs = sent.filter((x) => x.includes('模型调用失败'));
+    ok('多次 error 重试在 settled 只发 1 条报错且不被半截输出吞掉',
+      errMsgs.length === 1 && errMsgs[0].includes('Request timed out'),
+      JSON.stringify(sent));
+
     s.closed = true;
   }
 
@@ -837,6 +861,7 @@ const ok = (name, pass, extra) => { results.push({ name, pass }); console.log(`$
     ok('创建表已清空', B.creatingSessions.size === 0, `n=${B.creatingSessions.size}`);
     ok('没有产生多余实例', [...B.sessions.values()].filter((x) => x.key === 'private_77').length === 1);
 
+    await a.destroy('test');
     B.sessions.clear();
     B.creatingSessions.clear();
     B.cfg.behavior.maxSessions = savedMax;
@@ -1108,7 +1133,9 @@ const ok = (name, pass, extra) => { results.push({ name, pass }); console.log(`$
     ok('新实例已回注册表', B.sessions.get('private_91') === b);
 
     // 实例还在但子进程没了 (pi 崩了又没能重启): 也要重建, 不能交出去
+    const bProc = b.proc;
     b.proc = null;
+    try { if (bProc && bProc.kill) bProc.kill('SIGKILL'); } catch {}
     const c = await B.getSession(target);
     ok('子进程消失后重建', c !== b && !!c.proc && !c.closed,
       `same=${c === b} proc=${!!c.proc}`);

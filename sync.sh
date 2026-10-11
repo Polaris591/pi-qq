@@ -88,7 +88,7 @@ clear_persona() {
     const d = JSON.parse(fs.readFileSync(p, "utf8"));
     if (d.persona) { d.persona.text = ""; d.persona.groupBoundary = ""; }
     fs.writeFileSync(p, JSON.stringify(d, null, 2) + "\n");
-  ' "$1" 2>/dev/null || true
+  ' "$1"
 }
 
 log "生成通用化版本..."
@@ -130,12 +130,14 @@ done
 # 这一步是关键: 宁可同步失败, 也不能把隐私推上去。
 
 log "隐私自检..."
+shopt -s dotglob
 LEAK=0
 for f in "$TMP"/*; do
+  [ -e "$f" ] || continue
   base="$(basename "$f")"
-  if grep -qE '2452448276|317624779|648671136|3350987108|千雪|/opt/pi-qq|/opt/napcat' "$f" 2>/dev/null; then
+  if grep -rnqE '2452448276|317624779|648671136|3350987108|千雪|/opt/pi-qq|/opt/napcat' "$f" 2>/dev/null; then
     err "  ✗ $base 仍含隐私/绝对路径:"
-    grep -nE '2452448276|317624779|648671136|3350987108|千雪|/opt/pi-qq|/opt/napcat' "$f" | head -5 | sed 's/^/      /'
+    grep -rnE '2452448276|317624779|648671136|3350987108|千雪|/opt/pi-qq|/opt/napcat' "$f" | head -5 | sed 's/^/      /'
     LEAK=1
   else
     printf '  ✓ %s 干净\n' "$base"
