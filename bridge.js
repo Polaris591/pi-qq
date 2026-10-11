@@ -1047,6 +1047,7 @@ class PiSession {
         const msgs = rec.messages || [];
         const last = msgs[msgs.length - 1];
         const reason = last && last.stopReason;
+        this.lastStopReason = reason || null;
         // 空回复的成因签名: 整段回答被上游算进了思考通道 (output == reasoning, 正文为空)。
         // 2026-10-09 实测: cobblemon/deepseek-v4.1-flash 1696 轮里 18 次空回复,
         // 18 次都是这个签名; 同期 workbuddy/deepseek 445 轮 0 次。是上游的毛病。
@@ -1057,6 +1058,7 @@ class PiSession {
         // 实测这中间能隔好几分钟 —— 期间如果只等 settled 才 flush, 用户就一直看不到
         // 已经生成好的回复。所以这里先强制发一次, settled 那次再发就是空操作。
         if (reason && reason !== 'toolUse' && reason !== 'error') {
+          this.pendingErrorNotice = null;
           this.flush(true).catch((e) => warn(`[${this.key}] flush 失败: ${e.message}`));
         }
         if (reason === 'error' && !this.abortRequested) {
@@ -1064,9 +1066,13 @@ class PiSession {
           if (typeof this.onTaskError === 'function') { this.onTaskError('模型调用出错'); break; }
           this.flush(true).catch((e) => warn(`[${this.key}] flush 失败: ${e.message}`));
           const tail = this.stderrTail.join('').trim().split('\n').slice(-4).join('\n');
+          const errMsg = (last && last.errorMessage) ? String(last.errorMessage).trim() : '';
+          const detail = tail || errMsg;
           // 不用 ``` 围栏: QQ 不渲染 Markdown, 三个反引号会原样露出来
-          const body = tail ? `\n${mdToPlain(tail)}` : '';
-          this.sendQQ(`❌ 模型调用失败${body}`, { plain: true }).catch((e) => warn(`发送提示失败: ${e.message}`));
+          const body = detail ? `\n${mdToPlain(detail)}` : '';
+          // 先暂存: pi 内部自带自动重试, 每次单次失败都会发 agent_end(error)。
+          // 等到 agent_settled 时若仍未恢复才发唯一一条报错, 避免一次抖动连刷多条。
+          this.pendingErrorNotice = `❌ 模型调用失败${body}`;
         }
         break;
       }
@@ -1076,10 +1082,12 @@ class PiSession {
         this.lastSilenceNoticeAt = 0;
         this.busy = false;
         if (DEBUG_ON) debug(`[${this.key}] busy=false (agent_settled)`);
-        // 空回复兜底: 模型偶尔会只输出思考、不给正文就结束(stopReason=stop)。
-        // 桥接没东西可发, 用户那边就是彻底的静默 —— 看起来像卡死, 实际是这一轮
-        // 什么都没有。必须主动说一声, 否则用户只能靠再发一条来探活。
-        if (!this.turnHadOutput && !this.abortRequested) {
+        if (this.pendingErrorNotice && !this.turnHadOutput && !this.abortRequested) {
+          const notice = this.pendingErrorNotice;
+          this.pendingErrorNotice = null;
+          this.emptyRetries = 0;
+          this.sendQQ(notice, { plain: true }).catch((e) => warn(`发送提示失败: ${e.message}`));
+        } else if (!this.turnHadOutput && !this.abortRequested && this.lastStopReason !== 'error') {
           warn(`[${this.key}] 本轮没有产生任何正文输出`);
           const retries = this.emptyRetries || 0;
           if (retries < 1 && this.lastPrompt) {
@@ -1113,6 +1121,8 @@ class PiSession {
         } else if (this.turnHadOutput) {
           this.emptyRetries = 0;   // 正常出话就清零
         }
+        this.pendingErrorNotice = null;
+        this.lastStopReason = null;
         this.abortRequested = false;
         this.rejectRequeues = 0;   // 这一轮正常结束了, 被拒重试的计数清零
         this.lastUsed = Date.now();
