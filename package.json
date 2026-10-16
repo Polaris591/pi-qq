@@ -5,9 +5,11 @@
   "main": "bridge.js",
   "scripts": {
     "start": "node bridge.js",
-    "test": "node utest.js && node itest.js",
+    "test": "node utest.js && node itest.js && node fixtest.js",
     "test:unit": "node utest.js",
-    "test:e2e": "node itest.js"
+    "test:e2e": "node itest.js",
+    "test:fix": "node fixtest.js",
+    "test:goal": "node goaltest.js"
   },
   "keywords": [
     "qq",

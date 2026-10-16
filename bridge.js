@@ -95,6 +95,8 @@ const cfg = {
     heartbeatTimeoutMs: 90000,
     // 单轮看门狗: pi 处于 busy 且该毫秒数内没有任何事件 => 判定卡死, 强制打断, 0 关闭
     turnTimeoutMs: 45 * 60 * 1000,
+    // 扩展(pi-goal-x 等)提问后最多等用户多久: 超时就回 cancelled, 不让 pi 永久阻塞
+    uiDialogTimeoutMs: 30 * 60 * 1000,
     // 静默提醒: pi 处于 busy 且该毫秒数内没有任何输出 => 发一条「还在跑」, 0 关闭
     // 模型长思考或长命令执行时, 桥接没有任何 text_delta 可发, 用户会以为死了。
     // 静默提醒默认值放宽: pi 在长命令执行期间会周期性发 tool_execution_update 心跳,
@@ -704,6 +706,13 @@ class PiSession {
     this.spawnedAt = 0;              // 本次 pi 子进程的启动时刻 (退避判断用)
     this.spawnFailures = 0;          // 连续快速失败次数
     this.respawnTimer = null;
+    // 扩展(pi-goal-x 等)的 UI 交互协议 (rpc-extension-ui):
+    // notify/setStatus 等是「通知类」, 对话框(select/confirm/input/editor)则要
+    // 等 QQ 用户回答后才能回 extension_ui_response, 否则 pi 那边一直阻塞。
+    this.pendingUI = null;           // 正在等用户回答的对话框 { id, method, options, timer }
+    this.extStatus = new Map();      // setStatus 的最近状态 (排查用)
+    this.extWidget = '';             // setWidget 的最近内容 (目标进度条等)
+    this.extensionTurn = false;      // 本轮由扩展自己发起 (跳过「空回复自动重试」)
     if (this.ephemeral) {
       // 任务会话: 每次执行都是全新上下文, 不污染用户当前会话
       this.spawnId = `${slug(key)}-task-${Date.now().toString(36)}`;
@@ -942,16 +951,21 @@ class PiSession {
         const tries = this.rejectRequeues || 0;
         // 「压缩中」是可恢复的: 把消息放回队首, 等压缩结束再跑一次。
         // 其他原因(模型不存在 / 参数错误)重试只会再错一遍, 直接告诉用户。
+        // 「压缩中」可恢复, 但压缩本身很慢: 20MB 会话实测要 3.5 分钟。
+        // 原来 2 秒一次只重试 3 次, 压缩还没结束就撞完了, 用户白等一场。
+        // 改成指数退避 (3s 起, 封顶 2 分钟), 总窗口约 7 分钟。
         const retryable = /compact/i.test(msg);
-        if (retryable && tries < 2 && this.lastPrompt) {
+        const maxTries = 8;
+        if (retryable && tries < maxTries && this.lastPrompt) {
           this.rejectRequeues = tries + 1;
           this.queue.unshift(this.lastPrompt);
-          log(`[${this.key}] prompt 被拒(压缩中), 已重新排队 (第 ${this.rejectRequeues} 次)`);
+          const delay = Math.min(3000 * 2 ** tries, 120000);
+          log(`[${this.key}] prompt 被拒(压缩中), 已重新排队 (第 ${this.rejectRequeues} 次, ${Math.round(delay / 1000)}s 后)`);
           if (this.requeueTimer) clearTimeout(this.requeueTimer);
           this.requeueTimer = setTimeout(() => {
             this.requeueTimer = null;
             if (!this.closed) this.drainQueue();
-          }, 2000);
+          }, delay);
           if (this.requeueTimer.unref) this.requeueTimer.unref();
           return;
         } else {
@@ -994,6 +1008,26 @@ class PiSession {
       return;
     }
     switch (rec.type) {
+      case 'agent_start': {
+        // 扩展(如 /goal)自己发起的 LLM 回合不经过 bridge 的 prompt(), 忙状态只能
+        // 在这里补上 —— 否则目标跑着的时候用户会以为会话空闲, 消息发进去就成了
+        // 「streaming 中不收」的报错。
+        if (!this.busy) {
+          this.busy = true;
+          this.extensionTurn = true;
+          this.turnHadOutput = false;
+          this.thinkChars = 0;
+          this.thinkGuardFired = false;
+          this.lastEventAt = Date.now();
+          this.lastOutputAt = Date.now();
+          if (DEBUG_ON) debug(`[${this.key}] busy=true (agent_start, 扩展发起)`);
+        }
+        break;
+      }
+      case 'extension_ui_request': {
+        this.onExtensionUi(rec);
+        break;
+      }
       case 'message_update': {
         const ev = rec.assistantMessageEvent || {};
         if (ev.type === 'thinking_delta') {
@@ -1085,6 +1119,10 @@ class PiSession {
         break;
       }
       case 'agent_settled': {
+        // 扩展自己发起的那一轮: 它靠 notify/对话框给用户回话, 正文常常是空的。
+        // 那种「空回复」不是上游的毛病, 不能按空回复去重发上一条用户消息。
+        const wasExtensionRun = this.extensionTurn;
+        this.extensionTurn = false;
         this.flush(true).catch((e) => warn(`[${this.key}] flush 失败: ${e.message}`));
         this.silenceNotices = 0;
         this.lastSilenceNoticeAt = 0;
@@ -1095,7 +1133,7 @@ class PiSession {
           this.pendingErrorNotice = null;
           this.emptyRetries = 0;
           this.sendQQ(notice, { plain: true }).catch((e) => warn(`发送提示失败: ${e.message}`));
-        } else if (!this.turnHadOutput && !this.abortRequested && this.lastStopReason !== 'error') {
+        } else if (!wasExtensionRun && !this.turnHadOutput && !this.abortRequested && this.lastStopReason !== 'error') {
           warn(`[${this.key}] 本轮没有产生任何正文输出`);
           const retries = this.emptyRetries || 0;
           if (retries < 1 && this.lastPrompt) {
@@ -1412,6 +1450,173 @@ class PiSession {
     return this.send(cmd);
   }
 
+  // ---- 扩展 UI 协议 (rpc-extension-ui) ----
+
+  /**
+   * 处理 pi 发来的扩展 UI 请求。
+   *
+   * 「通知类」(notify 等) 直接转成 QQ 消息; 对话框类必须等用户回答,
+   * 否则 pi 那边的 handler 会一直挂在那里。pi-goal-x 的 /goal 草拟、
+   * 任务证据补写、/goal-focus 选择目标全走对话框, 不接这一步就等于不能用。
+   */
+  onExtensionUi(rec) {
+    const method = rec && rec.method;
+    if (!method) return;
+    if (method === 'notify') {
+      const msg = String(rec.message == null ? '' : rec.message).trim();
+      if (!msg) return;
+      // 命令结果(如 /goal-status 的看板)只走这条路 —— 必须发出去
+      const tag = rec.notifyType === 'error' ? '❌ ' : rec.notifyType === 'warning' ? '⚠️ ' : '';
+      this.sendQQ(`${tag}${msg}`, { plain: true })
+        .catch((e) => warn(`[${this.key}] 扩展提示发送失败: ${e.message}`));
+      return;
+    }
+    if (method === 'setStatus') {
+      this.extStatus.set(String(rec.statusKey || 'status'), String(rec.statusText == null ? '' : rec.statusText));
+      return;
+    }
+    if (method === 'setWidget') {
+      this.extWidget = (rec.widgetLines || []).join('\n');
+      return;
+    }
+    if (method !== 'select' && method !== 'confirm' && method !== 'input' && method !== 'editor') return;
+
+    // 同时只允许一个对话框在等。新的来了就把旧的取消, 不然两条提问的答案会串台。
+    if (this.pendingUI) {
+      const old = this.clearPendingUI();
+      this.replyUI(old.id, { cancelled: true });
+    }
+
+    const title = String(rec.title == null ? '' : rec.title).trim() || '(没有标题)';
+    const options = method === 'select'
+      ? (rec.options || []).map((o) => String(o))
+      : null;
+    let question;
+    if (method === 'select') {
+      question = `${title}\n${options.map((o, i) => `${i + 1}. ${o}`).join('\n')}\n\n回复序号即可（或回复 /cancel 放弃）`;
+    } else if (method === 'confirm') {
+      const msg = String(rec.message == null ? '' : rec.message).trim();
+      question = `${title}${msg ? `\n${msg}` : ''}\n\n回复 是 或 否（/cancel 放弃）`;
+    } else if (method === 'input') {
+      const ph = String(rec.placeholder == null ? '' : rec.placeholder).trim();
+      question = `${title}${ph ? `\n（比如：${ph}）` : ''}\n\n直接回复内容就行（/cancel 放弃）`;
+    } else {
+      const pre = String(rec.prefill == null ? '' : rec.prefill).trim();
+      question = `${title}${pre ? `\n当前内容：\n${pre}` : ''}\n\n直接回复修改后的完整内容（/cancel 放弃）`;
+    }
+
+    const timeoutMs = Math.max(10000, Number(cfg.behavior.uiDialogTimeoutMs) || 30 * 60 * 1000);
+    const entry = { id: rec.id, method, title, options, askedAt: Date.now(), timer: null };
+    entry.timer = setTimeout(() => {
+      if (this.pendingUI !== entry) return;
+      this.pendingUI = null;
+      this.replyUI(entry.id, { cancelled: true });
+      this.sendQQ(`⌛ 这个提问等了 ${Math.round(timeoutMs / 60000)} 分钟没人回答，已经自动放弃了。`,
+        { plain: true }).catch((e) => warn(`[${this.key}] 超时提示发送失败: ${e.message}`));
+    }, timeoutMs);
+    if (entry.timer.unref) entry.timer.unref();
+    this.pendingUI = entry;
+    this.sendQQ(`❓ ${question}`, { plain: true })
+      .catch((e) => warn(`[${this.key}] 提问发送失败: ${e.message}`));
+  }
+
+  /** 回一个扩展 UI 响应 (只有对话框方法需要) */
+  replyUI(id, payload) {
+    this.send({ type: 'extension_ui_response', id, ...payload });
+  }
+
+  /** 清掉当前待答对话框并取消其超时定时器 */
+  clearPendingUI() {
+    const p = this.pendingUI;
+    this.pendingUI = null;
+    if (p && p.timer) clearTimeout(p.timer);
+    return p;
+  }
+
+  /**
+   * 把用户的一条消息当作扩展对话框的答案。
+   * 返回 true 表示这条消息已被消费 (即使答案不合法, 也只是重新问一遍)。
+   * 返回 false 表示「放弃提问了, 这条消息该继续走正常流程」—— 只在用户敲了
+   * 别的命令时发生, 否则命令会被当成答案吞掉。
+   */
+  answerUI(text) {
+    const p = this.pendingUI;
+    if (!p) return false;
+    const raw = String(text == null ? '' : text).trim();
+    // 只有「放弃」和「取消」算取消; 别的斜杠命令是「我不想回答, 我要干别的」
+    if (/^\/cancel$/i.test(raw) || /^(取消|算了|放弃|不答了)$/.test(raw)) {
+      const cur = this.clearPendingUI();
+      this.replyUI(cur.id, { cancelled: true });
+      this.sendQQ('👌 已放弃这次提问。', { plain: true }).catch(() => {});
+      return true;
+    }
+    if (raw.startsWith('/')) {
+      const cur = this.clearPendingUI();
+      this.replyUI(cur.id, { cancelled: true });
+      this.sendQQ('👌 已放弃这次提问，按你刚发的命令继续。', { plain: true }).catch(() => {});
+      return false;
+    }
+    if (!raw) return true;   // 空消息(例如只发了张图): 不消费, 继续等
+
+    if (p.method === 'confirm') {
+      const yes = /^(y|yes|是|好|好的|可以|确定|确认|ok|okay)$/i.test(raw);
+      const no = /^(n|no|否|不|不用|不要)$/i.test(raw);
+      if (!yes && !no) {
+        this.sendQQ('没听懂，回复 是 或 否就行（/cancel 放弃）。', { plain: true }).catch(() => {});
+        return true;
+      }
+      this.clearPendingUI();
+      this.replyUI(p.id, { confirmed: yes });
+      return true;
+    }
+
+    let value = raw;
+    if (p.method === 'select') {
+      const opts = p.options || [];
+      if (/^\d+$/.test(raw)) {
+        const i = Number(raw);
+        if (i < 1 || i > opts.length) {
+          this.sendQQ(`序号得在 1-${opts.length} 之间（/cancel 放弃）。`, { plain: true }).catch(() => {});
+          return true;
+        }
+        value = opts[i - 1];
+      } else {
+        // 也允许直接回选项原文: pi 那边拿到的必须是选项里逐字相同的字符串
+        const hit = opts.find((o) => o === raw) || opts.find((o) => o.toLowerCase() === raw.toLowerCase());
+        if (!hit) {
+          this.sendQQ('没认出来，回复序号就行（/cancel 放弃）。', { plain: true }).catch(() => {});
+          return true;
+        }
+        value = hit;
+      }
+    }
+    this.clearPendingUI();
+    this.replyUI(p.id, { value });
+    return true;
+  }
+
+  /**
+   * 原样转发一条扩展命令 (/goal 系列等)。
+   *
+   * 不能用 prompt(): 它会往前面拼长期记忆前缀, 首行就不是 /goal 了, pi 会把
+   * 整段当成普通消息丢给模型, 命令根本不执行。也不排队 —— pi 的扩展命令是
+   * 「立即执行」的, 会话正忙时也能用(/goal-pause 就是要在跑着的时候用)。
+   */
+  async runExtension(text) {
+    this.lastUsed = Date.now();
+    // 扩展自己管 LLM 交互, 这里不设 lastPrompt: 否则那一轮万一没正文,
+    // 空回复重试会把上一条普通用户消息重发一遍。
+    this.lastPrompt = null;
+    try {
+      await this.request({ type: 'prompt', message: text }, 120000);
+    } catch (e) {
+      await this.sendQQ(`❌ 命令没跑起来：${e.message}`, { plain: true })
+        .catch((err) => warn(`[${this.key}] 命令失败提示发送失败: ${err.message}`));
+      return false;
+    }
+    return true;
+  }
+
   drainQueue() {
     // 进程不在时不能派发: 消息留在队列里, 等 scheduleRespawn 重启完成后自己来取
     if (this.busy || this.workLabel || !this.proc || !this.queue.length) return;
@@ -1523,6 +1728,11 @@ class PiSession {
       this.sendQQ(`⚠️ 会话已结束（${reason}），${n} 条排队消息被丢弃，需要的话重发一下。`, { plain: true })
         .catch((e) => warn(`[${this.key}] 丢弃队列提示发送失败: ${e.message}`));
     }
+    if (this.pendingUI) {
+      // pi 那边还挂着在等这个回答 —— 先给它一个 cancelled, 别让它带着阻塞退出
+      const p = this.clearPendingUI();
+      if (this.proc) this.replyUI(p.id, { cancelled: true });
+    }
     for (const [, p] of this.pending) {
       clearTimeout(p.timer);
       p.reject(new Error('会话已销毁'));
@@ -1554,6 +1764,8 @@ const creatingSessions = new Map();
 function silenceDue(s, now, silenceMs, maxNotices) {
   // busy = 正在跑一轮 prompt; workLabel = 正在跑一个耗时的非 prompt 操作
   if (!s.busy && !s.workLabel) return null;
+  // 正在等用户回答扩展的提问: 不是静默, 别发「还在跑」刷屏
+  if (s.pendingUI) return null;
   const idle = now - (s.lastOutputAt || s.lastEventAt || now);
   if (idle < silenceMs) return null;
   const sent = s.silenceNotices || 0;
@@ -2614,11 +2826,13 @@ async function runTask(t) {
   // 等任务跑完再销毁, 避免长期占用进程; 两个定时器互相清理, 保证只销毁一次
   return new Promise((resolveDone) => {
     let finished = false;
+    let taskRetryTimer = null;
     const finish = async (why, errNote) => {
       if (finished) return;
       finished = true;
       clearInterval(iv);
       clearTimeout(deadline);
+      if (taskRetryTimer) { clearTimeout(taskRetryTimer); taskRetryTimer = null; }
       taskSessions.delete(ps);
       await ps.destroy(why);
       if (errNote) notifyTarget(target, errNote).catch((e) => warn(`发送提示失败: ${e.message}`));
@@ -2642,8 +2856,24 @@ async function runTask(t) {
       `⏰ 定时任务「${label}」超时了（超过 30 分钟），已中止。可以把它拆小一点。`), 30 * 60 * 1000);
     deadline.unref();
 
-    // 失败要主动告知: 任务在后台跑, 用户看不到日志, 不通知就等于悄悄不工作了
+    // 失败要主动告知: 任务在后台跑, 用户看不到日志, 不通知就等于悄悄不工作了。
+    // 上游长输出偶发 unexpected EOF: 先自动续跑一次, 重试仍失败才报错退出。
+    let taskRetries = 0;
     ps.onTaskError = (reason) => {
+      if (taskRetries < 1 && !finished && !ps.closed && ps.proc) {
+        taskRetries++;
+        warn(`任务 ${t.id} ${reason}, 自动重试一次 (${taskRetries}/1)`);
+        ps.workLabel = '任务重试中';
+        if (taskRetryTimer) clearTimeout(taskRetryTimer);
+        taskRetryTimer = setTimeout(() => {
+          taskRetryTimer = null;
+          if (finished || ps.closed || !ps.proc) return;
+          ps.workLabel = '';
+          ps.prompt('刚才上游连接中断了，请接着上一步继续完成任务。', [], { replyTo: null, atUser: null });
+        }, 1500);
+        if (taskRetryTimer.unref) taskRetryTimer.unref();
+        return;
+      }
       const tail = ps.stderrTail.join('').trim().split('\n').slice(-3).join('\n');
       const body = tail ? `\n${mdToPlain(tail)}` : '';
       finish('task error', `❌ 定时任务「${label}」执行失败（${reason}）${body}`);
@@ -2716,11 +2946,30 @@ const HELP = [
   '/steer    任务跑着时追加要求（不打断）',
   '/queue    查看排队情况',
   '/stop     中断当前正在执行的任务',
+  '/cancel   放弃扩展正在问的那个问题',
   '/status   查看当前会话状态',
   '/help     显示本帮助',
   '',
+  '🎯 目标模式（pi-goal-x，会自动拆任务并一直跑到完成）',
+  '/goal          草拟一个目标（我会问你几个问题，回序号即可）',
+  '/goal-direct   目标，立刻开工不提问',
+  '/sisyphus      草拟一个思西弗斯目标（必须带分步验收标准）',
+  '/goal-status   目标看板 /goal-list 列出所有目标',
+  '/goal-pause    暂停目标 /goal-resume 继续目标',
+  '/goal-focus    选一个目标专注 /goal-clear 归档当前目标',
+  '',
   '直接发消息即可对话；支持图片。群聊中需 @我，被 @ 时会自动带上群内最近 60 条消息作为背景。',
 ].join('\n');
+
+// pi-goal-x 注册的扩展命令。命中后原样转发给 pi, 输出由扩展的 notify 转达。
+// 没装这个包时这些名字只是普通文本, 不会影响对话。
+const GOAL_CMDS = new Set([
+  '/goal', '/sisyphus',
+  '/goal-direct', '/sisyphus-direct',
+  '/goal-list', '/goal-status', '/goal-refresh', '/goal-recovery',
+  '/goal-focus', '/goal-unfocus', '/goal-settings',
+  '/goal-tweak', '/goal-clear', '/goal-pause', '/goal-resume', '/goal-cancel',
+]);
 
 /** 解析 `/cmd 2` 形式的序号参数, 越界返回 null */
 function pickIndex(arg, len) {
@@ -3161,6 +3410,13 @@ async function handleIncoming(rec) {
     }).catch((e) => warn(`贴表情失败: ${e.message}`));
   }
 
+  // ---- 扩展对话框（如 /goal 草拟的提问）在等回答: 这条消息就是答案。
+  // 必须放在命令分发之前: 否则用户回一个「1」会被当成普通消息丢给模型,
+  // 而 pi 那边的 handler 还挂在那里等, 两边一起卡住。
+  if (live.pendingUI) {
+    if (live.answerUI(text)) return;
+  }
+
   // ---- 内置命令: 命中就直接结束, 没命中返回 false 继续走对话流程
   const [c0, ...cmdArgs] = text.trim().split(/\s+/);
   const cmd = c0.toLowerCase();
@@ -3261,6 +3517,12 @@ async function dispatchCommand(session, cmd, arg, ctx) {
   session.lastUsed = Date.now();
 
   if (cmd === '/help' || cmd === '帮助') { await session.sendQQ(HELP); return true; }
+
+  // ---- pi-goal-x 的 /goal 系列: 原样转发给 pi (不注入记忆前缀), 输出走 notify
+  if (GOAL_CMDS.has(cmd)) {
+    await session.runExtension(`${cmd}${arg ? ` ${arg}` : ''}`);
+    return true;
+  }
 
   if (cmd === '/new') {
     if (session.isWorking()) { await session.sendQQ('⏳ 当前任务执行中，请先 /stop。'); return true; }
@@ -3449,7 +3711,9 @@ async function dispatchCommand(session, cmd, arg, ctx) {
       const payload = { type: 'compact' };
       if (arg) payload.customInstructions = arg;
       session.beginWork('压缩上下文');
-      const r = await session.request(payload, 180000).finally(() => session.endWork());
+      // 压缩耗时跟会话大小成正比, 20MB 会话实测 3.5 分钟, 原来 180s 会误判超时
+      // (超时后 pi 其实还在压, 后续 prompt 全被 "compaction in progress" 拒掉)。
+      const r = await session.request(payload, 600000).finally(() => session.endWork());
       const before = r && r.tokensBefore;
       const after = r && r.estimatedTokensAfter;
       const fmt = (n) => (n == null ? '-' : Number(n).toLocaleString('en-US'));
@@ -4211,6 +4475,8 @@ function start() {
       const now = Date.now();
       for (const [k, s] of sessions) {
         if (!s.busy || s.closed) continue;
+        // 扩展在向用户提问时不是「卡住」, 是在等人。这时候打断会把问题弄丢。
+        if (s.pendingUI) continue;
         const idle = now - (s.lastEventAt || now);
         if (idle <= TURN_TIMEOUT_MS) continue;
         const mins = Math.round(idle / 60000);

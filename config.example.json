@@ -57,6 +57,7 @@
     "groupContextCacheMs": 30000,
     "heartbeatTimeoutMs": 90000,
     "turnTimeoutMs": 2700000,
+    "uiDialogTimeoutMs": 1800000,
     "selfHealMs": 120000,
     "taskTickMs": 20000,
     "missedWindowMs": 1800000,

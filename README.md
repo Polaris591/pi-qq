@@ -188,6 +188,32 @@ memory/
 | `/status` | 会话状态 |
 | `/help` | 帮助 |
 
+### 扩展命令（pi 扩展注册的命令）
+
+扩展可以用 `pi.registerCommand()` 注册命令。桥接把这类命令**原样**转发给 pi，
+并把扩展的 UI 交互接到 QQ 上：
+
+- `notify` → 直接发成 QQ 消息（命令结果基本都走这条路）
+- `select` / `confirm` / `input` / `editor` → 转成带编号的提问，回序号即可；
+  回 `/cancel`（或「取消」）放弃；回别的斜杠命令会先放弃提问、再执行那条命令
+- 提问默认等 30 分钟（`behavior.uiDialogTimeoutMs`），超时自动放弃
+
+装法：`pi install npm:<包名>`。已实测的是 **pi-goal-x**（目标模式，目标会自动拆任务
+并一直跑到完成）：
+
+| 命令 | 作用 |
+|---|---|
+| `/goal` | 草拟目标（会问你几个问题，回序号即可） |
+| `/goal-direct` | 直接开工，不提问 |
+| `/sisyphus` | 草拟 Sisyphus 目标（要求分步验收标准） |
+| `/goal-status` `/goal-list` | 目标看板 / 列出所有目标 |
+| `/goal-pause` `/goal-resume` | 暂停 / 继续 |
+| `/goal-focus` `/goal-clear` | 选一个目标专注 / 归档当前目标 |
+
+两个容易踩的点：扩展命令**不能**走普通对话那条路（会拼上记忆前缀，首行就不是
+`/goal` 了，pi 会当成普通消息），所以桥接是原样转发；扩展命令在 pi 里是「立即执行」的，
+会话正忙时也能用（`/goal-pause` 就是要在跑着的时候用）。
+
 ## 文件交付
 
 AI 把要给你的文件写进 `outbox/`，桥接 2 秒内自动发到 QQ：
@@ -246,6 +272,18 @@ npm run test:e2e      # 只跑集成测试 (慢, 约 1 分钟)
 ```bash
 node itest.js --keep       # 保留临时目录, 方便排查
 node itest.js --with-pi    # 额外跑真 pi 的端到端用例 (慢, 需要模型可用)
+```
+
+**扩展命令测试** (`goaltest.js`, 10 条)
+
+`/goal` 系列的端到端：命令转发（扩展的 notify 要变成 QQ 消息）、对话框往返
+（`select` 转编号提问、回序号、`/cancel` 放弃、乱答兜底）。必须用**真 pi**
+（假 pi 不会注册扩展命令），并已装 `pi-goal-x`。
+
+```bash
+npm run test:goal                  # 命令转发 + 对话框（不花模型额度）
+node goaltest.js --with-agent      # 额外真跑一轮 /goal-direct（花额度，约 2 分钟）
+node goaltest.js --keep            # 保留临时目录
 ```
 
 ## 已知限制
